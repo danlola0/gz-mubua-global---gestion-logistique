@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    @apply antialiased text-slate-900 bg-slate-100;
+  }
+}
+
+@media print {
+  body {
+    background: white !important;
+    color: black !important;
+  }
+
+  header,
+  aside,
+  .no-print {
+    display: none !important;
+  }
+
+  main {
+    padding: 0 !important;
+    margin: 0 !important;
+    max-width: 100% !important;
+  }
+
+  /* A printable sheet (e.g. parcel label) is portalled under <body>:
+     print it alone, without the app behind it or the modal chrome. */
+  body:has(> .print-sheet-root) > #root {
+    display: none !important;
+  }
+
+  .print-sheet-root,
+  .print-sheet-frame,
+  .print-sheet-body {
+    position: static !important;
+    display: block !important;
+    max-height: none !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    background: white !important;
+    backdrop-filter: none !important;
+    box-shadow: none !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+  }
+
+  .print-label {
+    box-shadow: none !important;
+    max-width: 120mm;
+    margin: 0 auto;
+    break-inside: avoid;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

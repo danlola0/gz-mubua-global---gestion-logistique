@@ -1,0 +1,46 @@
+{
+  "users": [
+    {
+      "id": "1\n",
+      "username": "daniel",
+      "fullName": "yongo lola",
+      "email": "daniellolayongo@gmail.com",
+      "phone": "0823263196",
+      "role": "admin",
+      "agencyId": "1",
+      "agencyName": "Kinshasa",
+      "status": "active",
+      "createdAt": "2026-10-09"
+    }
+  ],
+  "agencies": [
+    {
+      "id": "1",
+      "code": "001",
+      "name": "Kinshasa",
+      "country": "RDC",
+      "city": "Kinshasa",
+      "address": "lemba ",
+      "phone": "0823263196",
+      "email": "daniellolayongo@gmail.com",
+      "type": "destination",
+      "managerName": "daniel"
+    }
+  ],
+  "clients": [],
+  "parcels": [],
+  "shipments": [],
+  "payments": [],
+  "expenses": [],
+  "employees": [],
+  "salaryPayments": [],
+  "exchangeRates": {
+    "USD": 1,
+    "CNY": 7.25,
+    "CDF": 2850,
+    "AOA": 920,
+    "lastUpdated": "2026-10-09"
+  },
+  "auditLogs": [],
+  "notifications": []
+}

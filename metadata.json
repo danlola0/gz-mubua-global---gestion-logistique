@@ -1,0 +1,6 @@
+{
+  "name": "GZ MUBUA GLOBAL - Gestion Logistique & Fret",
+  "description": "Plateforme intégrée de gestion de fret maritime et aérien Chine - Kinshasa - Angola pour GZ MUBUA GLOBAL : colis, expéditions, caisse multi-devises, agences, suivi et livraisons.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

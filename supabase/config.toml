@@ -1,0 +1,4 @@
+[functions.api]
+# The gateway itself must allow anonymous requests for public tracking.
+# Private operations verify the bearer token and profile/role in api/index.ts.
+verify_jwt = false

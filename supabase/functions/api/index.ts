@@ -1,0 +1,782 @@
+import { createClient } from 'npm:@supabase/supabase-js@2';
+import { computeParcelPricing, currencyRate, isPricingCurrency, roundMoney } from '../_shared/parcelPricing.ts';
+
+type Role = 'admin' | 'china_team' | 'kinshasa_team' | 'cashier' | 'client';
+type Profile = { id: string; username: string; full_name: string; email: string; phone: string; role: Role; agency_id: string | null; agency_name: string | null; status: string };
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': Deno.env.get('APP_ORIGIN') || '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+};
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status,
+  headers: { ...corsHeaders, 'Content-Type': 'application/json; charset=utf-8' },
+});
+// Columns ending in _usd map to the frontend's ...USD keys (total_cost_usd <-> totalCostUSD).
+const snakeToCamel = (key: string) => key.replace(/_usd$/, 'USD').replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+const camelToSnake = (key: string) => key.replace(/USD$/, '_usd').replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+const fromRow = (row: Record<string, unknown>) => Object.fromEntries(Object.entries(row).map(([key, value]) => [snakeToCamel(key), value]));
+const toRow = (row: Record<string, unknown>) => Object.fromEntries(Object.entries(row).map(([key, value]) => [camelToSnake(key), value]));
+const today = () => new Date().toISOString().slice(0, 10);
+const nowTime = () => new Date().toISOString().slice(11, 16);
+const id = (prefix: string) => `${prefix}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+const allowed: Record<string, Record<string, Role[]>> = {
+  users: { GET: ['admin'], POST: ['admin'], PUT: ['admin'], DELETE: ['admin'] },
+  agencies: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'] },
+  'exchange-rates': { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'], PUT: ['admin'] },
+  stats: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier'] },
+  'audit-logs': { GET: ['admin'] },
+  notifications: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'], POST: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'] },
+  clients: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier'], POST: ['admin', 'china_team', 'kinshasa_team', 'cashier'], PUT: ['admin'], DELETE: ['admin'] },
+  parcels: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'], POST: ['admin', 'china_team'], PUT: ['admin'], DELETE: ['admin'] },
+  shipments: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier'], POST: ['admin', 'china_team'], PUT: ['admin', 'china_team'], DELETE: ['admin'] },
+  payments: { GET: ['admin', 'cashier', 'client'], POST: ['admin', 'cashier'], DELETE: ['admin'] },
+  expenses: { GET: ['admin', 'cashier'], POST: ['admin', 'cashier'], PUT: ['admin'], DELETE: ['admin'] },
+  employees: { GET: ['admin'], POST: ['admin'], PUT: ['admin'], DELETE: ['admin'] },
+  salaries: { GET: ['admin'], POST: ['admin'], DELETE: ['admin'] },
+  supabase: { GET: ['admin'], POST: ['admin'] },
+  uploads: { POST: ['admin', 'china_team'] },
+};
+const PHOTO_BUCKET = 'parcel-photos';
+const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
+const MAX_PARCEL_PHOTOS = 10;
+// Validation failures that should reach the user with a precise message and status.
+class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+const tables = new Set(['users', 'agencies', 'clients', 'parcels', 'shipments', 'payments', 'expenses', 'employees', 'salary_payments', 'audit_logs', 'notifications']);
+
+const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
+const anonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
+const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+const authClient = createClient(supabaseUrl, anonKey, { auth: { persistSession: false, autoRefreshToken: false } });
+const db = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false, autoRefreshToken: false } });
+
+async function audit(actor: Profile, action: string, entityType: string, entityId: string, details: string, oldValue?: unknown, newValue?: unknown) {
+  const { error } = await db.from('audit_logs').insert({
+    id: id('LOG'), timestamp: new Date().toISOString(), user_id: actor.id, user_name: actor.full_name,
+    user_role: actor.role, agency_name: actor.agency_name, action, entity_type: entityType,
+    entity_id: entityId, details, old_value: oldValue ?? null, new_value: newValue ?? null,
+  });
+  if (error) throw error;
+}
+
+function auditRow(actor: Profile, action: string, entityType: string, entityId: string, details: string, oldValue?: unknown, newValue?: unknown) {
+  return { id: id('LOG'), timestamp: new Date().toISOString(), user_id: actor.id, user_name: actor.full_name, user_role: actor.role, agency_name: actor.agency_name, action, entity_type: entityType, entity_id: entityId, details, old_value: oldValue ?? null, new_value: newValue ?? null };
+}
+
+function notificationRow(type: string, title: string, message: string, targetRole = 'ALL', parcelTracking?: string) {
+  return { id: id('NOTIF'), timestamp: new Date().toISOString(), type, title, message, target_role: targetRole, parcel_tracking: parcelTracking ?? null, is_read: false };
+}
+
+async function notify(type: string, title: string, message: string, targetRole = 'ALL', parcelTracking?: string) {
+  const { error } = await db.from('notifications').insert({
+    id: id('NOTIF'), timestamp: new Date().toISOString(), type, title, message,
+    target_role: targetRole, parcel_tracking: parcelTracking ?? null, is_read: false,
+  });
+  if (error) throw error;
+}
+
+async function list(table: string, order = 'created_at'): Promise<any[]> {
+  const { data, error } = await db.from(table).select('*').order(order, { ascending: false });
+  if (error) throw error;
+  return (data || []).map(fromRow);
+}
+
+async function nextSequence(counter: string) {
+  const { data, error } = await db.rpc('next_app_sequence', { p_counter_name: counter });
+  if (error) throw error;
+  return Number(data);
+}
+
+async function loadRatesRow() {
+  const { data, error } = await db.from('exchange_rates').select('*').order('id', { ascending: true }).limit(1).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+// API shape expected by the frontend (ExchangeRates in src/types).
+function ratesResponse(row: any) {
+  return {
+    USD: 1,
+    CNY: Number(row?.cny_rate) || 7.25,
+    CDF: Number(row?.cdf_rate) || 2850,
+    AOA: Number(row?.aoa_rate) || 920,
+    lastUpdated: row?.last_updated || today(),
+    maritimePricePerKg: Number(row?.maritime_price_per_kg) || 0,
+    aerienPricePerKg: Number(row?.aerien_price_per_kg) || 0,
+    freightRateCurrency: isPricingCurrency(row?.freight_rate_currency) ? row.freight_rate_currency : 'USD',
+  };
+}
+
+async function assertExists(table: string, recordId: string | null, label: string) {
+  if (!recordId) return;
+  const { data, error } = await db.from(table).select('id').eq('id', recordId).maybeSingle();
+  if (error) throw error;
+  if (!data) throw new ApiError(400, `${label} introuvable (${recordId}). Sélectionnez une valeur existante.`);
+}
+
+// Turn PostgREST/Postgres errors into messages an operator can act on.
+function describeDbError(error: unknown): string {
+  const e = (error ?? {}) as { message?: string; code?: string; details?: string };
+  if (e.code === '23503') return `Référence invalide (agence, client ou expédition inexistant). ${e.details || ''}`.trim();
+  if (e.code === '23505') return `Doublon refusé par la base : ${e.details || e.message || ''}`.trim();
+  if (e.code === '23514') return 'Valeur refusée par la base : les montants et le poids doivent être positifs.';
+  if (e.code === '23502') return `Champ obligatoire manquant : ${e.message || ''}`.trim();
+  if (e.code === '42703' || e.code === 'PGRST204') return `Colonne absente dans Supabase (${e.message || ''}). Appliquez la migration 202610110002_parcel_freight_pricing.sql.`;
+  return e.message || 'Erreur serveur';
+}
+
+function ratesToUsd(currency: string, amount: number, rates: Record<string, number>) {
+  const rate = currency === 'USD' ? 1 : Number(rates[currency]) || 1;
+  return { exchangeRate: rate, amountUSD: currency === 'USD' ? amount : Number((amount / rate).toFixed(2)) };
+}
+
+async function refreshClient(clientId?: string | null) {
+  if (!clientId) return;
+  const [{ data: parcels, error: parcelError }, { data: payments, error: paymentError }] = await Promise.all([
+    db.from('parcels').select('total_cost_usd').eq('client_id', clientId),
+    db.from('payments').select('amount_usd').eq('client_id', clientId),
+  ]);
+  if (parcelError) throw parcelError;
+  if (paymentError) throw paymentError;
+  const total = ((parcels || []) as Array<{ total_cost_usd: number | string | null }>).reduce((sum: number, row) => sum + Number(row.total_cost_usd || 0), 0);
+  const paid = ((payments || []) as Array<{ amount_usd: number | string | null }>).reduce((sum: number, row) => sum + Number(row.amount_usd || 0), 0);
+  const { error } = await db.from('clients').update({ total_parcels: (parcels || []).length, total_amount_usd: total, total_paid_usd: paid, remaining_balance_usd: Math.max(0, total - paid) }).eq('id', clientId);
+  if (error) throw error;
+}
+
+async function recalculateParcel(parcelId: string) {
+  const { data: parcel, error } = await db.from('parcels').select('client_id,total_cost_usd').eq('id', parcelId).maybeSingle();
+  if (error) throw error;
+  if (!parcel) return;
+  const { data: payments, error: paymentError } = await db.from('payments').select('amount_usd').eq('parcel_id', parcelId);
+  if (paymentError) throw paymentError;
+  const paid = ((payments || []) as Array<{ amount_usd: number | string | null }>).reduce((sum: number, row) => sum + Number(row.amount_usd || 0), 0);
+  const { error: updateError } = await db.from('parcels').update({ amount_paid_usd: paid, remaining_amount_usd: Math.max(0, Number(parcel.total_cost_usd || 0) - paid) }).eq('id', parcelId);
+  if (updateError) throw updateError;
+  await refreshClient(parcel.client_id);
+}
+
+async function calculateStats() {
+  const [parcels, shipments, payments, expenses, clients, salaries] = await Promise.all([
+    list('parcels'), list('shipments'), list('payments'), list('expenses'), list('clients'), list('salary_payments'),
+  ]);
+  const count = (items: any[], statuses: string[]) => items.filter((item) => statuses.includes(item.status)).length;
+  const sum = (items: any[], key: string) => items.reduce((total, item) => total + Number(item[key] || 0), 0);
+  const byCurrency = (currency: string) => sum(payments.filter((p) => p.currency === currency), 'originalAmount') - sum(expenses.filter((e) => e.currency === currency), 'originalAmount');
+  const revenue = sum(payments, 'amountUSD');
+  const spend = sum(expenses, 'amountUSD');
+  return {
+    parcels: { total: parcels.length, inChina: count(parcels, ['COMMANDE_CREEE', 'ATTENTE_RECEPTION_CHINE', 'RECU_CHINE', 'IDENTIFIE', 'CONTROLE', 'PREPARE_EXPEDITION', 'EXPEDITION_EN_PREPARATION']), inTransit: count(parcels, ['EXPEDIE', 'EN_TRANSIT']), arrived: count(parcels, ['ARRIVE_DESTINATION', 'DEDOUANEMENT_TRAITEMENT']), availableAtAgency: count(parcels, ['DISPONIBLE_AGENCE', 'PREPARATION_LIVRAISON', 'EN_COURS_LIVRAISON']), delivered: count(parcels, ['LIVRE', 'RETIRE_CLIENT']), anomalies: count(parcels, ['ANOMALIE']) },
+    shipments: { total: shipments.length, maritime: shipments.filter((s) => s.transportMode === 'MARITIME').length, aerien: shipments.filter((s) => s.transportMode === 'AERIEN').length, inProgress: count(shipments, ['EN_PREPARATION', 'EXPEDIE', 'EN_TRANSIT']), arrived: count(shipments, ['ARRIVE', 'TRAITE']) },
+    finances: { totalRevenueUSD: revenue, totalExpensesUSD: spend, netBalanceUSD: revenue - spend, clientTotalPaidUSD: sum(clients, 'totalPaidUSD'), clientTotalRemainingUSD: sum(clients, 'remainingBalanceUSD'), totalSalariesPaidUSD: sum(salaries, 'netSalaryUSD'), chinaExpensesUSD: sum(expenses.filter((e) => e.country === 'Chine'), 'amountUSD'), kinshasaExpensesUSD: sum(expenses.filter((e) => e.country === 'RDC'), 'amountUSD'), angolaExpensesUSD: sum(expenses.filter((e) => e.country === 'Angola'), 'amountUSD'), balancesByCurrency: { USD: byCurrency('USD'), CNY: byCurrency('CNY'), CDF: byCurrency('CDF'), AOA: byCurrency('AOA') } },
+    clients: { total: clients.length, active: clients.filter((c) => Number(c.totalParcels) > 0).length, withPendingBalance: clients.filter((c) => Number(c.remainingBalanceUSD) > 0).length },
+  };
+}
+
+async function createParcel(body: any, actor: Profile) {
+  const clientName = String(body.clientName || '').trim();
+  const clientPhone = String(body.clientPhone || '').trim();
+  const description = String(body.description || '').trim();
+  if (!clientName || !clientPhone || !description) throw new ApiError(400, 'Nom du client, téléphone et description sont obligatoires.');
+
+  // Price on the server from the universal tariff; the browser's amounts are never trusted.
+  const rates = ratesResponse(await loadRatesRow());
+  const transportMode = body.transportMode === 'AERIEN' ? 'AERIEN' : 'MARITIME';
+  const currency = rates.freightRateCurrency;
+  const pricePerKg = transportMode === 'AERIEN' ? rates.aerienPricePerKg : rates.maritimePricePerKg;
+  if (body.pricingCurrency !== undefined && (body.pricingCurrency !== currency || Number(body.appliedPricePerKg || 0) !== pricePerKg)) {
+    throw new ApiError(409, 'Le tarif par kg a été modifié entre-temps. Fermez puis rouvrez le formulaire pour appliquer le tarif actuel.');
+  }
+  const pricing = computeParcelPricing({
+    weightKg: Number(body.weightKg),
+    pricePerKg,
+    manualFreightAmount: Number(body.transportCost ?? 0),
+    extraFees: Number(body.extraFees ?? 0),
+    amountPaid: Number(body.amountPaid ?? 0),
+    currency,
+    exchangeRate: currencyRate(currency, rates),
+  });
+  if (!pricing.ok) throw new ApiError(400, pricing.error);
+  const price = pricing.value;
+
+  await assertExists('clients', body.clientId || null, 'Client');
+  await assertExists('agencies', body.chinaAgencyId || null, 'Agence Chine');
+  await assertExists('agencies', body.destinationAgencyId || null, 'Agence de destination');
+  await assertExists('shipments', body.shipmentId || null, 'Expédition');
+
+  const seq = await nextSequence('parcel');
+  const receiptSeq = price.amountPaid > 0 ? await nextSequence('payment') : 0;
+  const now = today();
+  const weight = Number(body.weightKg);
+  const l = Number(body.lengthCm) || 0, w = Number(body.widthCm) || 0, h = Number(body.heightCm) || 0;
+  const volume = l && w && h ? Number(((l * w * h) / 1_000_000).toFixed(3)) : Number(body.volumeCbm) || 0.05;
+  const parcelId = id('PAR'), tracking = `COL-${new Date().getFullYear()}-${String(seq).padStart(6, '0')}`;
+  const status = body.status || 'COMMANDE_CREEE';
+  const parcel = {
+    id: parcelId, tracking_number: tracking, client_id: body.clientId || null, client_name: clientName,
+    client_phone: clientPhone, description, quantity: Number(body.quantity) || 1,
+    weight_kg: weight, length_cm: l || null, width_cm: w || null, height_cm: h || null, volume_cbm: volume,
+    photos: Array.isArray(body.photos)
+      ? body.photos.filter((url: unknown) => typeof url === 'string' && url.startsWith('https://')).slice(0, MAX_PARCEL_PHOTOS)
+      : [],
+    supplier: body.supplier || '', purchase_info: body.purchaseInfo || '',
+    china_reception_address: body.chinaReceptionAddress || '', china_reception_date: body.chinaReceptionDate || now,
+    china_agency_id: body.chinaAgencyId || null, china_agency_name: body.chinaAgencyName || '',
+    shipment_id: body.shipmentId || null, shipment_number: body.shipmentNumber || null,
+    transport_mode: transportMode, origin: body.origin || '', destination: body.destination || '',
+    destination_agency_id: body.destinationAgencyId || null, destination_agency_name: body.destinationAgencyName || '',
+    status, status_history: [{ id: id('SH'), status, date: now, time: nowTime(), user: actor.full_name, agency: actor.agency_name, comment: body.comment || 'Création du colis' }],
+    pricing_currency: price.currency, price_per_kg: price.pricePerKg, pricing_exchange_rate: price.exchangeRate,
+    freight_amount: price.freightAmount, total_amount: price.totalAmount,
+    transport_cost_usd: price.transportCostUSD, extra_fees_usd: price.extraFeesUSD,
+    total_cost_usd: price.totalCostUSD, amount_paid_usd: 0, remaining_amount_usd: price.totalCostUSD,
+    warehouse_location: body.warehouseLocation || '', comments: body.comments || '', created_at: now, updated_at: now,
+  };
+  let payment: Record<string, unknown> | null = null;
+  if (price.amountPaid > 0) {
+    payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(receiptSeq).padStart(4, '0')}`, parcel_id: parcelId, parcel_tracking_number: tracking, client_id: parcel.client_id, client_name: parcel.client_name, type: 'AVANCE', original_amount: price.amountPaid, currency: price.currency, exchange_rate: price.exchangeRate, amount_usd: price.amountPaidUSD, payment_method: body.paymentMethod || 'ESPECES', date: now, time: nowTime(), agency_id: parcel.china_agency_id, agency_name: parcel.china_agency_name, cashier_id: actor.id, cashier_name: actor.full_name, notes: `Acompte initial du colis ${tracking}` };
+  }
+  const { data, error } = await db.rpc('create_parcel_transaction', {
+    parcel_data: parcel,
+    payment_data: payment,
+    audit_data: auditRow(actor, 'CREATE', 'PARCEL', parcelId, `Création du colis ${tracking}`),
+    notification_data: notificationRow('PARCEL_CREATED', `Nouveau colis ${tracking}`, `Colis enregistré pour ${parcel.client_name}.`, 'ALL', tracking),
+  });
+  if (error) throw error;
+  return fromRow(data);
+}
+
+async function createPayment(body: any, actor: Profile) {
+  const seq = await nextSequence('payment');
+  const { data: ratesRow, error: ratesError } = await db.from('exchange_rates').select('*').limit(1).maybeSingle();
+  if (ratesError) throw ratesError;
+  const currency = body.currency || 'USD', amount = Number(body.originalAmount) || 0;
+  const rates = { CNY: Number(ratesRow?.cny_rate) || 7.25, CDF: Number(ratesRow?.cdf_rate) || 2850, AOA: Number(ratesRow?.aoa_rate) || 920 };
+  const { exchangeRate, amountUSD } = ratesToUsd(currency, amount, rates);
+  const payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, parcel_id: body.parcelId || null, parcel_tracking_number: body.parcelTrackingNumber || null, client_id: body.clientId || null, client_name: body.clientName, type: body.type || 'AVANCE', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, payment_method: body.paymentMethod || 'ESPECES', reference: body.reference || '', date: body.date || today(), time: nowTime(), agency_id: actor.agency_id, agency_name: actor.agency_name, cashier_id: actor.id, cashier_name: actor.full_name, notes: body.notes || '' };
+  const { data, error } = await db.rpc('record_payment_transaction', {
+    payment_data: payment,
+    audit_data: auditRow(actor, 'PAYMENT', 'PAYMENT', payment.id, `Encaissement ${payment.receipt_number} de ${amount} ${currency}`),
+    notification_data: notificationRow('PAYMENT_RECEIVED', `Paiement reçu : ${amount} ${currency}`, `Règlement ${payment.receipt_number} enregistré.`, 'cashier'),
+  });
+  if (error) throw error;
+  return fromRow(data);
+}
+
+async function createExpense(body: any, actor: Profile) {
+  const seq = await nextSequence('expense');
+  const { data: ratesRow, error: ratesError } = await db.from('exchange_rates').select('*').limit(1).maybeSingle();
+  if (ratesError) throw ratesError;
+  const currency = body.currency || 'USD', amount = Number(body.originalAmount) || 0;
+  const rates = { CNY: Number(ratesRow?.cny_rate) || 7.25, CDF: Number(ratesRow?.cdf_rate) || 2850, AOA: Number(ratesRow?.aoa_rate) || 920 };
+  const { exchangeRate, amountUSD } = ratesToUsd(currency, amount, rates);
+  const expense = { id: id('DEP'), voucher_number: `DEP-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, category: body.category || 'autres', category_label: body.categoryLabel || body.category || 'Autres', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, agency_id: actor.agency_id, agency_name: actor.agency_name, country: body.country || 'RDC', beneficiary: body.beneficiary || '', date: body.date || today(), time: nowTime(), recorded_by: actor.full_name, description: body.description || '', attachment_name: body.attachmentName || null, attachment_url: body.attachmentUrl || null };
+  const { data, error } = await db.rpc('create_expense_transaction', {
+    expense_data: expense,
+    audit_data: auditRow(actor, 'EXPENSE', 'EXPENSE', expense.id, `Dépense ${expense.voucher_number} : ${amount} ${currency}`),
+  });
+  if (error) throw error;
+  return fromRow(data);
+}
+
+async function handle(request: Request): Promise<Response> {
+  if (request.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
+  const url = new URL(request.url);
+  const path = url.pathname.replace(/^\/functions\/v1\/api/, '').replace(/^\/api/, '') || '/';
+  const parts = path.split('/').filter(Boolean).map(decodeURIComponent);
+  const method = request.method.toUpperCase();
+  const body = ['POST', 'PUT', 'PATCH'].includes(method) ? await request.json().catch(() => ({})) : {};
+
+  let actor: Profile | null = null;
+  const isPublicTrack = method === 'GET' && parts[0] === 'track' && parts.length === 2;
+  if (isPublicTrack) {
+    const clientIp = request.headers.get('cf-connecting-ip') || request.headers.get('x-real-ip') || request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+    const { data: withinLimit, error: limitError } = await db.rpc('check_public_track_rate_limit', { p_request_key: clientIp, p_limit: 30 });
+    if (limitError) {
+      console.error('[Public tracking rate limit]', limitError);
+      return json({ error: 'Le suivi public est temporairement indisponible.' }, 503);
+    }
+    if (!withinLimit) return json({ error: 'Trop de recherches. Réessayez dans une minute.' }, 429);
+  }
+  if (!isPublicTrack) {
+    const token = request.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+    if (!token) return json({ error: 'Session Supabase requise.' }, 401);
+    const { data: auth, error: authError } = await authClient.auth.getUser(token);
+    if (authError || !auth.user) return json({ error: 'Session Supabase invalide ou expirée.' }, 401);
+    const { data: profile, error: profileError } = await db.from('users').select('*').eq('auth_user_id', auth.user.id).eq('status', 'active').maybeSingle();
+    if (profileError || !profile) return json({ error: 'Aucun profil actif associé à cette session.' }, 403);
+    actor = profile as Profile;
+    const operation = parts[0] || '';
+    let roles = allowed[operation]?.[method];
+    if (operation === 'parcels' && parts[2] === 'status' && method === 'POST') roles = ['admin', 'china_team', 'kinshasa_team'];
+    if (operation === 'shipments' && parts[2] === 'depart' && method === 'POST') roles = ['admin', 'china_team'];
+    if (operation === 'shipments' && parts[2] === 'arrive' && method === 'POST') roles = ['admin', 'kinshasa_team'];
+    if (operation === 'shipments' && parts[2] === 'parcels' && method === 'POST') roles = ['admin', 'china_team'];
+    if (!roles?.includes(actor.role)) return json({ error: 'Votre rôle ne permet pas cette opération.' }, 403);
+  }
+
+  try {
+    const route = parts[0];
+    const table = route === 'salaries' ? 'salary_payments' : route === 'audit-logs' ? 'audit_logs' : route;
+    const resourceId = parts[1];
+    if (actor?.role === 'client' && table === 'parcels' && resourceId && parts[2] !== 'status') {
+      const { data: ownedParcel, error } = await db.from('parcels').select('id').eq('id', resourceId).eq('client_phone', actor!.phone).maybeSingle();
+      if (error) throw error;
+      if (!ownedParcel) return json({ error: 'Colis non trouvé.' }, 404);
+    }
+    if (actor?.role === 'client' && table === 'payments' && resourceId) {
+      const { data: ownedPayment, error } = await db.from('payments').select('id,client_id').eq('id', resourceId).maybeSingle();
+      if (error) throw error;
+      if (!ownedPayment) return json({ error: 'Paiement non trouvé.' }, 404);
+      const { data: ownedClient, error: clientError } = await db.from('clients').select('id').eq('id', ownedPayment.client_id).eq('phone', actor!.phone).maybeSingle();
+      if (clientError) throw clientError;
+      if (!ownedClient) return json({ error: 'Paiement non trouvé.' }, 404);
+    }
+    if (isPublicTrack) {
+      const { data, error } = await db.from('parcels').select('tracking_number,transport_mode,destination,destination_agency_name,status,status_history').eq('tracking_number', parts[1].toUpperCase()).maybeSingle();
+      if (error) throw error;
+      if (!data) return json({ error: 'Aucun colis trouvé avec ce numéro de suivi.' }, 404);
+      return json({ trackingNumber: data.tracking_number, transportMode: data.transport_mode, destination: data.destination, destinationAgencyName: data.destination_agency_name, status: data.status, statusHistory: (data.status_history || []).map(({ status, date, time }: any) => ({ status, date, time })) });
+    }
+
+    if (table === 'auth') return json({ error: 'Utilisez Supabase Auth.' }, 404);
+    if (table === 'supabase') {
+      if (parts[1] === 'status' && method === 'GET') return json({ isConfigured: true, url: supabaseUrl, message: 'Supabase Edge Function active.' });
+      if (parts[1] === 'test' && method === 'POST') {
+        const { error } = await db.from('exchange_rates').select('id').limit(1).maybeSingle();
+        return error
+          ? json({ success: false, tablesStatus: 'error', message: error.message })
+          : json({ success: true, tablesStatus: 'ready', message: 'Connexion Supabase et table des taux opérationnelles.' });
+      }
+      if (parts[1] === 'counts' && method === 'GET') {
+        const counts: Record<string, number> = {};
+        for (const name of ['parcels','clients','shipments','payments','expenses','employees','salary_payments','users','agencies','exchange_rates','audit_logs','notifications']) {
+          const { count, error } = await db.from(name).select('*', { count: 'exact', head: true });
+          if (error) throw error;
+          counts[name] = count || 0;
+        }
+        return json(counts);
+      }
+      return json({ error: 'Cette opération de synchronisation/configuration locale n’est plus disponible.' }, 410);
+    }
+
+    if (method === 'GET' && route === 'auth' && parts[1] === 'login') return json({ error: 'Utilisez Supabase Auth.' }, 410);
+
+    if (route === 'stats' && method === 'GET') {
+      const stats = await calculateStats();
+      if (!['admin', 'cashier'].includes(actor!.role)) delete (stats as any).finances;
+      return json(stats);
+    }
+    if (table === 'notifications' && method === 'GET') {
+      const rows = await list('notifications', 'timestamp');
+      return json(rows.filter((item: any) => item.targetRole === 'ALL' || item.targetRole === actor!.role));
+    }
+    if (table === 'notifications' && method === 'POST' && parts[1] === 'mark-read') {
+      const notificationId = (body as any).id;
+      if (notificationId === 'all' && actor!.role !== 'admin') return json({ error: 'Action réservée à l’administrateur.' }, 403);
+      let query = db.from('notifications').update({ is_read: true });
+      if (notificationId === 'all' && actor!.role !== 'admin') query = query.in('target_role', ['ALL', actor!.role]);
+      else query = query.eq('id', notificationId).in('target_role', ['ALL', actor!.role]);
+      const { error } = await query;
+      if (error) throw error;
+      return json({ success: true });
+    }
+    if (route === 'exchange-rates' && method === 'PUT') {
+      // Merge with the stored row so a partial update never resets other values.
+      const input = body as any;
+      const existingRow = await loadRatesRow();
+      const current = ratesResponse(existingRow);
+      const positive = (value: unknown, fallback: number, label: string, allowZero = false) => {
+        if (value === undefined || value === null || value === '') return fallback;
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 0 || (!allowZero && n === 0)) throw new ApiError(400, `${label} invalide : saisissez un nombre ${allowZero ? 'positif ou nul' : 'strictement positif'}.`);
+        return n;
+      };
+      if (input.freightRateCurrency !== undefined && !isPricingCurrency(input.freightRateCurrency)) {
+        throw new ApiError(400, 'Devise du tarif au kg non prise en charge (USD, CNY, CDF ou AOA).');
+      }
+      const rates = {
+        id: existingRow?.id ?? 1,
+        usd_rate: 1,
+        cny_rate: positive(input.CNY, current.CNY, 'Taux CNY'),
+        cdf_rate: positive(input.CDF, current.CDF, 'Taux CDF'),
+        aoa_rate: positive(input.AOA, current.AOA, 'Taux AOA'),
+        maritime_price_per_kg: roundMoney(positive(input.maritimePricePerKg, current.maritimePricePerKg, 'Tarif maritime/kg', true)),
+        aerien_price_per_kg: roundMoney(positive(input.aerienPricePerKg, current.aerienPricePerKg, 'Tarif aérien/kg', true)),
+        freight_rate_currency: input.freightRateCurrency ?? current.freightRateCurrency,
+        last_updated: today(),
+      };
+      const { data: saved, error } = await db.from('exchange_rates').upsert(rates).select('*').single();
+      if (error) throw error;
+      const tariffChanged = rates.maritime_price_per_kg !== current.maritimePricePerKg || rates.aerien_price_per_kg !== current.aerienPricePerKg || rates.freight_rate_currency !== current.freightRateCurrency;
+      await audit(actor!, 'UPDATE', 'SETTINGS', 'EXCHANGE_RATES',
+        tariffChanged
+          ? `Mise à jour des taux et du tarif fret/kg (maritime ${rates.maritime_price_per_kg}, aérien ${rates.aerien_price_per_kg} ${rates.freight_rate_currency})`
+          : 'Mise à jour des taux de change',
+        current, ratesResponse(saved));
+      return json(ratesResponse(saved));
+    }
+    if (route === 'exchange-rates' && method === 'GET') {
+      return json(ratesResponse(await loadRatesRow()));
+    }
+
+    if (route === 'uploads' && parts[1] === 'parcel-photo' && method === 'POST') {
+      const dataUrl = (body as any).dataUrl;
+      const match = typeof dataUrl === 'string' ? dataUrl.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/) : null;
+      if (!match) throw new ApiError(400, 'Format de photo non pris en charge (JPEG, PNG ou WebP uniquement).');
+      const binary = atob(match[2]);
+      if (binary.length > MAX_PHOTO_BYTES) throw new ApiError(413, 'Photo trop volumineuse (5 Mo maximum).');
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      const extension = match[1] === 'image/png' ? 'png' : match[1] === 'image/webp' ? 'webp' : 'jpg';
+      const path = `parcels/${today().slice(0, 7)}/${crypto.randomUUID()}.${extension}`;
+      const { error } = await db.storage.from(PHOTO_BUCKET).upload(path, bytes, { contentType: match[1], upsert: false });
+      if (error) {
+        if (/bucket not found/i.test(error.message || '')) throw new ApiError(503, 'Stockage des photos non configuré : appliquez la migration 202610110003_parcel_photos_storage.sql.');
+        throw error;
+      }
+      const { data } = db.storage.from(PHOTO_BUCKET).getPublicUrl(path);
+      return json({ url: data.publicUrl }, 201);
+    }
+
+    if (!tables.has(table)) return json({ error: 'Route introuvable.' }, 404);
+    if (['users', 'agencies', 'clients', 'parcels', 'shipments', 'payments', 'expenses', 'employees', 'salary_payments', 'audit_logs', 'notifications'].includes(table) && method === 'GET' && !resourceId) {
+      const sort = table === 'agencies' ? 'name' : table === 'employees' ? 'hire_date' : table === 'audit_logs' || table === 'notifications' ? 'timestamp' : table === 'salary_payments' ? 'payment_date' : 'created_at';
+      const records = await list(table, sort);
+      let filtered = records;
+      if (actor!.role === 'client' && table === 'parcels') filtered = records.filter((row: any) => String(row.clientPhone || '').replace(/\D/g, '') === String(actor!.phone || '').replace(/\D/g, ''));
+      if (actor!.role === 'client' && table === 'payments') {
+        const clients = await list('clients');
+        const ids = new Set(clients.filter((client: any) => String(client.phone || '').replace(/\D/g, '') === String(actor!.phone || '').replace(/\D/g, '')).map((client: any) => client.id));
+        filtered = records.filter((row: any) => ids.has(row.clientId));
+      }
+      if (table === 'users') filtered = records.map(({ password: _password, authUserId: _authUserId, ...safe }: any) => safe);
+      if (table === 'audit_logs') filtered = filtered.slice(0, 200);
+      if (table === 'notifications') filtered = filtered.filter((row: any) => row.targetRole === 'ALL' || row.targetRole === actor!.role).slice(0, 100);
+      return json(filtered);
+    }
+
+    if (table === 'track') return json({ error: 'Route introuvable.' }, 404);
+
+    if (table === 'clients' && method === 'POST') {
+      const seq = await nextSequence('client');
+      const client = { id: id('CLI'), code: `CLI-${String(seq).padStart(3, '0')}`, full_name: (body as any).fullName, phone: (body as any).phone, email: (body as any).email || '', address: (body as any).address || '', city: (body as any).city || 'Kinshasa', country: (body as any).country || 'RDC', total_parcels: 0, total_amount_usd: 0, total_paid_usd: 0, remaining_balance_usd: 0, created_at: today(), notes: (body as any).notes || '' };
+      const { error } = await db.from('clients').insert(client);
+      if (error) throw error;
+      await audit(actor!, 'CREATE', 'CLIENT', client.id, `Création du client ${client.full_name}`);
+      return json(fromRow(client), 201);
+    }
+    if (table === 'parcels' && method === 'POST') return json(await createParcel(body, actor!), 201);
+    if (table === 'payments' && method === 'POST') return json(await createPayment(body, actor!), 201);
+    if (table === 'expenses' && method === 'POST') return json(await createExpense(body, actor!), 201);
+    if (table === 'employees' && method === 'POST') {
+      const input = body as any;
+      const seq = await nextSequence('employee');
+      const countryCode = input.country === 'Chine' ? 'GZ' : input.country === 'Angola' ? 'LAD' : 'KIN';
+      const employee = { id: id('EMP'), employee_code: `EMP-${countryCode}-${String(seq).padStart(2, '0')}`, full_name: input.fullName, phone: input.phone, job_title: input.jobTitle, agency_id: input.agencyId || null, agency_name: input.agencyName || actor!.agency_name, country: input.country || 'RDC', base_salary_usd: Number(input.baseSalaryUSD) || 500, preferred_currency: input.preferredCurrency || 'USD', status: 'actif', hire_date: input.hireDate || today() };
+      const { error } = await db.from('employees').insert(employee);
+      if (error) throw error;
+      await audit(actor!, 'CREATE', 'EMPLOYEE', employee.id, `Création employé ${employee.full_name}`);
+      return json(fromRow(employee), 201);
+    }
+    if (table === 'salary_payments' && method === 'POST') {
+      const input = body as any;
+      const seq = await nextSequence('salary');
+      const { data: ratesRow, error: ratesError } = await db.from('exchange_rates').select('*').limit(1).maybeSingle();
+      if (ratesError) throw ratesError;
+      const period = input.periodMonth || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
+      const base = Number(input.baseSalaryUSD) || 0, bonus = Number(input.primesUSD) || 0, advances = Number(input.avancesUSD) || 0, deductions = Number(input.retenuesUSD) || 0, overtime = Number(input.overtimeUSD) || 0;
+      const net = base + bonus + overtime - advances - deductions;
+      const currency = input.currency || 'USD';
+      const exchangeRate = currency === 'USD' ? 1 : currency === 'CNY' ? Number(ratesRow?.cny_rate) || 7.25 : currency === 'CDF' ? Number(ratesRow?.cdf_rate) || 2850 : currency === 'AOA' ? Number(ratesRow?.aoa_rate) || 920 : Number(input.exchangeRate) || 1;
+      const salary = { id: id('SAL'), slip_number: `PAY-${period}-${String(seq).padStart(3, '0')}`, employee_id: input.employeeId || null, employee_name: input.employeeName, job_title: input.jobTitle || '', agency_name: input.agencyName || actor!.agency_name, country: input.country || '', period_month: period, base_salary_usd: base, primes_usd: bonus, avances_usd: advances, retenues_usd: deductions, overtime_usd: overtime, net_salary_usd: net, paid_amount_original: currency === 'USD' ? net : Number((net * exchangeRate).toFixed(2)), currency, exchange_rate: exchangeRate, payment_date: input.paymentDate || today(), status: input.status || 'PAYE', payment_method: input.paymentMethod || 'Espèces', notes: input.notes || '' };
+      let expense: Record<string, unknown> | null = null;
+      if (salary.status === 'PAYE') {
+        const expenseSeq = await nextSequence('expense');
+        expense = { id: id('DEP'), voucher_number: `DEP-${new Date().getFullYear()}-${String(expenseSeq).padStart(4, '0')}`, category: 'salaire', category_label: 'Salaires & Rémunérations', original_amount: salary.paid_amount_original, currency, exchange_rate: exchangeRate, amount_usd: net, agency_id: input.agencyId || actor!.agency_id, agency_name: salary.agency_name, country: salary.country, beneficiary: salary.employee_name, date: salary.payment_date, time: nowTime(), recorded_by: actor!.full_name, description: `Règlement salaire ${period} [Bulletin ${salary.slip_number}]` };
+      }
+      const { data, error } = await db.rpc('create_salary_transaction', { salary_data: salary, expense_data: expense, audit_data: auditRow(actor!, 'PAYMENT', 'EMPLOYEE', salary.id, `Émission bulletin ${salary.slip_number} (${net} USD)`) });
+      if (error) throw error;
+      return json(fromRow(data), 201);
+    }
+
+    if (table === 'shipments' && method === 'POST') {
+      const seq = await nextSequence('shipment');
+      const shipment = { id: id('SHIP'), shipment_number: `EXP-${new Date().getFullYear()}-${String(seq).padStart(5, '0')}`, departure_agency_id: (body as any).departureAgencyId || null, departure_agency_name: (body as any).departureAgencyName || '', destination: (body as any).destination || '', destination_agency_id: (body as any).destinationAgencyId || null, destination_agency_name: (body as any).destinationAgencyName || '', transport_mode: (body as any).transportMode || 'MARITIME', carrier_name: (body as any).carrierName || '', container_or_flight_number: (body as any).containerOrFlightNumber || '', departure_date: (body as any).departureDate || null, estimated_arrival_date: (body as any).estimatedArrivalDate || null, actual_arrival_date: null, parcel_count: 0, total_weight_kg: 0, total_volume_cbm: 0, total_cost_usd: Number((body as any).totalCostUSD) || 0, status: 'EN_PREPARATION', parcel_ids: [], comments: (body as any).comments || '', created_at: today(), updated_at: today() };
+      const { error } = await db.from('shipments').insert(shipment);
+      if (error) throw error;
+      await audit(actor!, 'CREATE', 'SHIPMENT', shipment.id, `Création de l’expédition ${shipment.shipment_number}`);
+      return json(fromRow(shipment), 201);
+    }
+    if (table === 'shipments' && resourceId && method === 'PUT') {
+      const patch = toRow(body as Record<string, unknown>);
+      delete patch.id; delete patch.parcel_ids; delete patch.parcel_count;
+      const { data, error } = await db.from('shipments').update({ ...patch, updated_at: today() }).eq('id', resourceId).select('*').maybeSingle();
+      if (error) throw error;
+      if (!data) return json({ error: 'Expédition non trouvée.' }, 404);
+      await audit(actor!, 'UPDATE', 'SHIPMENT', resourceId, `Mise à jour de l’expédition ${data.shipment_number}`);
+      return json(fromRow(data));
+    }
+
+    if (table === 'parcels' && resourceId && parts[2] === 'status' && method === 'POST') {
+      const { data: parcel, error } = await db.from('parcels').select('*').eq('id', resourceId).maybeSingle();
+      if (error) throw error;
+      if (!parcel) return json({ error: 'Colis non trouvé.' }, 404);
+      const update = body as any;
+      const date = today(), status = update.status;
+      if (!status) return json({ error: 'Statut requis.' }, 400);
+      const chinaStatuses = ['RECU_CHINE', 'IDENTIFIE', 'CONTROLE', 'PREPARE_EXPEDITION', 'EXPEDITION_EN_PREPARATION', 'EXPEDIE', 'EN_TRANSIT', 'ANOMALIE'];
+      const destinationStatuses = ['ARRIVE_DESTINATION', 'DEDOUANEMENT_TRAITEMENT', 'DISPONIBLE_AGENCE', 'PREPARATION_LIVRAISON', 'EN_COURS_LIVRAISON', 'LIVRE', 'RETIRE_CLIENT', 'ANOMALIE'];
+      const allStatuses = [...chinaStatuses, ...destinationStatuses, 'COMMANDE_CREEE', 'ATTENTE_RECEPTION_CHINE'];
+      if (!allStatuses.includes(status)) return json({ error: 'Statut colis invalide.' }, 400);
+      if (actor!.role === 'china_team' && !chinaStatuses.includes(status)) return json({ error: 'Votre rôle ne permet pas ce statut.' }, 403);
+      if (actor!.role === 'kinshasa_team' && !destinationStatuses.includes(status)) return json({ error: 'Votre rôle ne permet pas ce statut.' }, 403);
+      const history = [...(parcel.status_history || []), { id: id('SH'), status, date, time: nowTime(), user: actor!.full_name, agency: actor!.agency_name, comment: update.comment || `Mise à jour du statut vers ${status}` }];
+      const patch: Record<string, unknown> = { status, status_history: history, updated_at: date };
+      for (const key of ['warehouseLocation','deliveryDriverName','deliveryDriverPhone','deliveryRecipient']) if (update[key]) patch[camelToSnake(key)] = update[key];
+      const notification = status === 'DISPONIBLE_AGENCE' || status === 'LIVRE' || status === 'RETIRE_CLIENT' || status === 'ANOMALIE'
+        ? notificationRow(status === 'DISPONIBLE_AGENCE' ? 'PARCEL_READY' : status === 'ANOMALIE' ? 'ANOMALY' : 'PARCEL_DELIVERED', `Mise à jour ${parcel.tracking_number}`, update.comment || `Nouveau statut : ${status}`, 'ALL', parcel.tracking_number)
+        : null;
+      const { data, error: updateError } = await db.rpc('update_parcel_status_transaction', {
+        target_id: resourceId,
+        next_status: status,
+        history_item: history.at(-1),
+        patch: toRow(update),
+        audit_data: auditRow(actor!, 'STATUS_CHANGE', 'PARCEL', resourceId, `Colis ${parcel.tracking_number}: ${parcel.status} → ${status}`, parcel.status, status),
+        notification_data: notification,
+      });
+      if (updateError) throw updateError;
+      return json(fromRow(data));
+    }
+
+    if (table === 'shipments' && resourceId && parts[2] === 'depart' && method === 'POST') {
+      const { data: shipment, error } = await db.from('shipments').select('*').eq('id', resourceId).maybeSingle();
+      if (error) throw error;
+      if (!shipment) return json({ error: 'Expédition non trouvée.' }, 404);
+      if (!['EN_PREPARATION', 'EXPEDIE', 'EN_TRANSIT'].includes(shipment.status)) return json({ error: `Transition départ impossible depuis le statut ${shipment.status}.` }, 400);
+      const date = (body as any).departureDate || today();
+      const { data, error: transitionError } = await db.rpc('transition_shipment_transaction', {
+        target_id: resourceId, transition: 'depart', event_date: date, actor_name: actor!.full_name,
+        actor_agency: actor!.agency_name,
+        audit_data: auditRow(actor!, 'STATUS_CHANGE', 'SHIPMENT', resourceId, `Départ validé pour ${shipment.shipment_number}.`),
+        notification_data: notificationRow('SHIPMENT_DEPARTED', `Expédition ${shipment.shipment_number} partie`, `Expédition en route vers ${shipment.destination}.`, 'ALL'),
+      });
+      if (transitionError) throw transitionError;
+      return json(fromRow(data));
+    }
+    if (table === 'shipments' && resourceId && parts[2] === 'arrive' && method === 'POST') {
+      const { data: shipment, error } = await db.from('shipments').select('*').eq('id', resourceId).maybeSingle();
+      if (error) throw error;
+      if (!shipment) return json({ error: 'Expédition non trouvée.' }, 404);
+      if (!['EXPEDIE', 'EN_TRANSIT'].includes(shipment.status)) return json({ error: `Transition arrivée impossible depuis le statut ${shipment.status}.` }, 400);
+      const date = (body as any).actualArrivalDate || today();
+      const { data, error: transitionError } = await db.rpc('transition_shipment_transaction', {
+        target_id: resourceId, transition: 'arrive', event_date: date, actor_name: actor!.full_name,
+        actor_agency: actor!.agency_name,
+        audit_data: auditRow(actor!, 'STATUS_CHANGE', 'SHIPMENT', resourceId, `Arrivée enregistrée pour ${shipment.shipment_number}.`),
+        notification_data: notificationRow('SHIPMENT_ARRIVED', `Expédition ${shipment.shipment_number} arrivée`, `Arrivée à ${shipment.destination}.`, 'ALL'),
+      });
+      if (transitionError) throw transitionError;
+      return json(fromRow(data));
+    }
+    if (table === 'shipments' && resourceId && parts[2] === 'parcels' && method === 'POST') {
+      const parcelIds = (body as any).parcelIds;
+      if (!Array.isArray(parcelIds) || parcelIds.some((value) => typeof value !== 'string')) return json({ error: 'Liste parcelIds invalide.' }, 400);
+      const { data, error } = await db.rpc('link_parcels_to_shipment_transaction', {
+        target_shipment_id: resourceId, target_parcel_ids: parcelIds, actor_name: actor!.full_name,
+        audit_data: auditRow(actor!, 'UPDATE', 'SHIPMENT', resourceId, `Ajout de ${parcelIds.length} colis à l’expédition.`),
+      });
+      if (error) throw error;
+      return json(fromRow(data));
+    }
+
+    if (table === 'users' && method === 'POST') {
+      const input = body as any;
+      if (!input.email || !input.fullName || !input.username || !input.role) return json({ error: 'Nom, identifiant, rôle et e-mail requis.' }, 400);
+      if (!['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'].includes(input.role)) return json({ error: 'Rôle utilisateur invalide.' }, 400);
+      const { data: invited, error: inviteError } = await db.auth.admin.inviteUserByEmail(input.email, { data: { full_name: input.fullName } });
+      if (inviteError) throw inviteError;
+      const user = { id: id('USR'), username: input.username, full_name: input.fullName, email: input.email, phone: input.phone || '', role: input.role, agency_id: input.agencyId || null, agency_name: input.agencyName || actor!.agency_name, status: 'active', created_at: new Date().toISOString(), auth_user_id: invited.user.id };
+      const { error } = await db.from('users').insert(user);
+      if (error) { await db.auth.admin.deleteUser(invited.user.id); throw error; }
+      await audit(actor!, 'CREATE', 'USER', user.id, `Invitation de ${user.full_name} (${user.role})`);
+      const { auth_user_id: _authId, ...safe } = user;
+      return json(fromRow(safe), 201);
+    }
+
+    if (table === 'users' && method === 'PUT' && resourceId) {
+      const input = body as any;
+      const patch: Record<string, unknown> = {};
+      for (const [source, target] of [['username','username'],['fullName','full_name'],['email','email'],['phone','phone'],['role','role'],['agencyId','agency_id'],['agencyName','agency_name'],['status','status']]) {
+        if (input[source] !== undefined) patch[target] = input[source];
+      }
+      if (patch.role && !['admin','china_team','kinshasa_team','cashier','client'].includes(String(patch.role))) return json({ error: 'Rôle utilisateur invalide.' }, 400);
+      const { data, error } = await db.from('users').update(patch).eq('id', resourceId).select('*').maybeSingle();
+      if (error) throw error;
+      if (!data) return json({ error: 'Utilisateur non trouvé.' }, 404);
+      await audit(actor!, 'UPDATE', 'USER', resourceId, `Mise à jour du profil ${data.username}`);
+      const { auth_user_id: _authUserId, ...safe } = data;
+      return json(fromRow(safe));
+    }
+
+    if (method === 'GET' && resourceId && table !== 'supabase') {
+      const { data, error } = await db.from(table).select('*').eq('id', resourceId).maybeSingle();
+      if (error) throw error;
+      if (!data) return json({ error: 'Enregistrement non trouvé.' }, 404);
+      if (actor!.role === 'client' && table === 'parcels' && String(data.client_phone || '').replace(/\D/g, '') !== String(actor!.phone || '').replace(/\D/g, '')) return json({ error: 'Colis non trouvé.' }, 404);
+      if (actor!.role === 'client' && table === 'payments') {
+        const { data: client, error: clientError } = await db.from('clients').select('phone').eq('id', data.client_id).maybeSingle();
+        if (clientError) throw clientError;
+        if (!client || String(client.phone || '').replace(/\D/g, '') !== String(actor!.phone || '').replace(/\D/g, '')) return json({ error: 'Paiement non trouvé.' }, 404);
+      }
+      if (table === 'users') {
+        const { password: _password, auth_user_id: _authUserId, ...safe } = data;
+        return json(fromRow(safe));
+      }
+      return json(fromRow(data));
+    }
+
+    if (['PUT','PATCH'].includes(method) && resourceId) {
+      const patch = toRow(body as Record<string, unknown>);
+      delete patch.id;
+      delete patch.auth_user_id;
+      delete patch.password;
+      if (table === 'parcels') {
+        // Totals, payments and the tariff snapshot are derived server-side only.
+        for (const key of ['total_cost_usd', 'amount_paid_usd', 'remaining_amount_usd', 'price_per_kg', 'pricing_exchange_rate', 'pricing_currency', 'freight_amount', 'total_amount']) delete patch[key];
+        if (patch.weight_kg !== undefined || patch.transport_cost_usd !== undefined || patch.extra_fees_usd !== undefined) {
+          const { data: existing, error: existingError } = await db.from('parcels').select('*').eq('id', resourceId).maybeSingle();
+          if (existingError) throw existingError;
+          if (!existing) return json({ error: 'Colis non trouvé.' }, 404);
+          const weight = Number(patch.weight_kg ?? existing.weight_kg);
+          const extraUSD = Number(patch.extra_fees_usd ?? existing.extra_fees_usd ?? 0);
+          if (!Number.isFinite(weight) || weight <= 0) throw new ApiError(400, 'Le poids doit être un nombre supérieur à 0 kg.');
+          if (!Number.isFinite(extraUSD) || extraUSD < 0) throw new ApiError(400, 'Les frais annexes ne peuvent pas être négatifs.');
+          const snapshotRate = Number(existing.price_per_kg) || 0;
+          if (snapshotRate > 0) {
+            // Re-price with the tariff frozen on this parcel, never the current universal tariff.
+            const fx = Number(existing.pricing_exchange_rate) || 1;
+            const freight = roundMoney(weight * snapshotRate);
+            patch.freight_amount = freight;
+            patch.transport_cost_usd = roundMoney(freight / fx);
+            patch.total_amount = roundMoney(freight + extraUSD * fx);
+          } else {
+            const transportUSD = Number(patch.transport_cost_usd ?? existing.transport_cost_usd ?? 0);
+            if (!Number.isFinite(transportUSD) || transportUSD < 0) throw new ApiError(400, 'Les frais de transport ne peuvent pas être négatifs.');
+            patch.transport_cost_usd = roundMoney(transportUSD);
+          }
+          patch.weight_kg = weight;
+          patch.extra_fees_usd = roundMoney(extraUSD);
+          patch.total_cost_usd = roundMoney(Number(patch.transport_cost_usd) + extraUSD);
+        }
+      }
+      const { data, error } = await db.from(table).update(patch).eq('id', resourceId).select('*').maybeSingle();
+      if (error) throw error;
+      if (!data) return json({ error: 'Enregistrement non trouvé.' }, 404);
+      if (table === 'parcels') { await recalculateParcel(resourceId); }
+      if (table === 'clients') await refreshClient(resourceId);
+      await audit(actor!, 'UPDATE', table.toUpperCase(), resourceId, `Mise à jour ${table} ${resourceId}`);
+      return json(fromRow(data));
+    }
+
+    if (method === 'DELETE' && resourceId) {
+      if (table === 'users' && resourceId === actor!.id) return json({ error: 'Vous ne pouvez pas supprimer votre propre compte actif.' }, 400);
+      if (table === 'employees') {
+        const { count, error } = await db.from('salary_payments').select('*', { count: 'exact', head: true }).eq('employee_id', resourceId);
+        if (error) throw error;
+        if ((count || 0) > 0) return json({ error: 'Suppression impossible : cet employé possède un historique de paie. Désactivez plutôt son profil.' }, 400);
+      }
+      if (table === 'clients') {
+        const [{ count: parcelCount }, { count: paymentCount }] = await Promise.all([
+          db.from('parcels').select('*', { count: 'exact', head: true }).eq('client_id', resourceId),
+          db.from('payments').select('*', { count: 'exact', head: true }).eq('client_id', resourceId),
+        ]);
+        if ((parcelCount || 0) + (paymentCount || 0) > 0) return json({ error: `Suppression impossible : ce client possède ${parcelCount || 0} colis et ${paymentCount || 0} paiements.` }, 400);
+      }
+      if (table === 'parcels') {
+        const { data: linkedPayments, error: linkedError } = await db.from('payments').select('id,receipt_number,original_amount,currency,amount_usd,client_id').eq('parcel_id', resourceId);
+        if (linkedError) throw linkedError;
+        const receipts = (linkedPayments || []) as any[];
+        if (receipts.length > 0) {
+          const totalUSD = roundMoney(receipts.reduce((sum, p) => sum + Number(p.amount_usd || 0), 0));
+          // Deleting cash receipts must be an explicit admin choice.
+          if (url.searchParams.get('withPayments') !== 'true') {
+            return json({
+              error: `Ce colis possède ${receipts.length} paiement(s) enregistré(s) (${totalUSD} $). Cochez « Supprimer aussi les reçus » pour le supprimer avec ses paiements.`,
+              paymentsCount: receipts.length,
+              paymentsTotalUSD: totalUSD,
+            }, 409);
+          }
+          const { data: parcelRow, error: parcelError } = await db.from('parcels').select('*').eq('id', resourceId).maybeSingle();
+          if (parcelError) throw parcelError;
+          if (!parcelRow) return json({ error: 'Colis non trouvé.' }, 404);
+          const { error } = await db.rpc('delete_parcel_with_payments_transaction', {
+            target_id: resourceId,
+            audit_data: auditRow(actor!, 'DELETE', 'PARCEL', resourceId,
+              `Suppression du colis ${parcelRow.tracking_number} avec ${receipts.length} reçu(s) : ${receipts.map((p) => `${p.receipt_number} (${p.original_amount} ${p.currency})`).join(', ')} — total ${totalUSD} $`,
+              { parcel: parcelRow, payments: receipts }, null),
+          });
+          if (error) throw error;
+          return json({ success: true, message: `Colis ${parcelRow.tracking_number} et ${receipts.length} reçu(s) supprimés.` });
+        }
+      }
+      const { data: before } = await db.from(table).select('*').eq('id', resourceId).maybeSingle();
+      if (!before) return json({ error: 'Enregistrement non trouvé.' }, 404);
+      if (table === 'payments') {
+        const { error } = await db.rpc('delete_payment_transaction', { target_id: resourceId, audit_data: auditRow(actor!, 'DELETE', 'PAYMENT', resourceId, `Suppression du reçu ${before.receipt_number}`) });
+        if (error) throw error;
+        return json({ success: true, message: `Reçu ${before.receipt_number} supprimé.` });
+      }
+      if (table === 'shipments') {
+        const { error } = await db.rpc('delete_shipment_transaction', { target_id: resourceId, audit_data: auditRow(actor!, 'DELETE', 'SHIPMENT', resourceId, `Suppression de l’expédition ${before.shipment_number}`) });
+        if (error) throw error;
+        return json({ success: true, message: `Expédition ${before.shipment_number} supprimée.` });
+      }
+      if (table === 'parcels') {
+        const { error } = await db.rpc('delete_parcel_transaction', { target_id: resourceId, audit_data: auditRow(actor!, 'DELETE', 'PARCEL', resourceId, `Suppression du colis ${before.tracking_number}`) });
+        if (error) throw error;
+        return json({ success: true, message: `Colis ${before.tracking_number} supprimé.` });
+      }
+      if (table === 'salary_payments') {
+        const { error } = await db.rpc('delete_salary_transaction', { target_id: resourceId, audit_data: auditRow(actor!, 'DELETE', 'SALARY', resourceId, `Suppression du bulletin ${before.slip_number}`) });
+        if (error) throw error;
+        return json({ success: true, message: `Bulletin ${before.slip_number} supprimé.` });
+      }
+      if (table === 'expenses') {
+        const { error } = await db.rpc('delete_expense_transaction', { target_id: resourceId, audit_data: auditRow(actor!, 'DELETE', 'EXPENSE', resourceId, `Suppression de la dépense ${before.voucher_number}`) });
+        if (error) throw error;
+        return json({ success: true, message: `Dépense ${before.voucher_number} supprimée.` });
+      }
+      if (table === 'users' && before.auth_user_id) {
+        const { error: authDeleteError } = await db.auth.admin.deleteUser(before.auth_user_id);
+        if (authDeleteError) throw authDeleteError;
+      }
+      if (table === 'shipments') {
+        const { error: unlinkError } = await db.from('parcels').update({ shipment_id: null, shipment_number: null }).eq('shipment_id', resourceId);
+        if (unlinkError) throw unlinkError;
+      }
+      const { error } = await db.from(table).delete().eq('id', resourceId);
+      if (error) throw error;
+      if (table === 'payments') {
+        if (before.parcel_id) await recalculateParcel(before.parcel_id);
+        else if (before.client_id) await refreshClient(before.client_id);
+      }
+      await audit(actor!, 'DELETE', table.toUpperCase(), resourceId, `Suppression ${table} ${resourceId}`);
+      return json({ success: true, message: 'Enregistrement supprimé.' });
+    }
+
+    return json({ error: 'Opération non implémentée dans la passerelle Edge.' }, 501);
+  } catch (error) {
+    if (error instanceof ApiError) return json({ error: error.message }, error.status);
+    console.error('[Edge API]', error);
+    const code = (error as { code?: string } | null)?.code;
+    const status = code && /^(23|22|PGRST2)/.test(code) ? 400 : 500;
+    return json({ error: describeDbError(error) }, status);
+  }
+}
+
+Deno.serve(handle);
