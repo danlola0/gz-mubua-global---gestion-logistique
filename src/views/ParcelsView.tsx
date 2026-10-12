@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import type { Parcel, ParcelStatus, TransportMode, UserRole } from '../types/index.ts';
 import { PARCEL_STATUSES } from '../types/index.ts';
-import { formatUSD, createWhatsAppTrackingLink } from '../services/api.ts';
+import { formatUSD, formatDay, createWhatsAppTrackingLink } from '../services/api.ts';
 
 interface ParcelsViewProps {
   parcels: Parcel[];
@@ -314,7 +314,7 @@ export const ParcelsView: React.FC<ParcelsViewProps> = ({
                       <div className="font-mono font-black text-slate-900 tracking-wider break-all">
                         {parcel.trackingNumber}
                       </div>
-                      <div className="text-[10px] text-slate-500">Créé le {parcel.createdAt}</div>
+                      <div className="text-[10px] text-slate-500">Reçu le {formatDay(parcel.chinaReceptionDate || parcel.createdAt)}</div>
                     </div>
                     <span
                       className={`shrink-0 px-2 py-0.5 rounded-md text-[10px] font-bold border ${
@@ -423,7 +423,7 @@ export const ParcelsView: React.FC<ParcelsViewProps> = ({
                           {parcel.trackingNumber}
                         </div>
                         <div className="text-[10px] text-slate-700 mt-0.5">
-                          Créé le {parcel.createdAt}
+                          Reçu le {formatDay(parcel.chinaReceptionDate || parcel.createdAt)}
                         </div>
                       </td>
 

@@ -95,7 +95,7 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
         originalAmount: Number(originalAmount),
         currency,
         agencyId,
-        agencyName: agency?.name || 'Agence GZ MUBUA',
+        agencyName: agency?.name || '',
         country: agency?.country || 'RDC',
         beneficiary,
         description,

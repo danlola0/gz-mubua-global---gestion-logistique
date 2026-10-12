@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Search,
   Package,
@@ -32,9 +32,24 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
   const [trackingResult, setTrackingResult] = useState<any | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  // Opened from a shared link or a notification: search immediately.
+  useEffect(() => {
+    if (initialTracking.trim()) void handleSearch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleSearch = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!trackingInput.trim()) return;
+
+    // An account activation code (XXXX-XXXX) is often typed here by mistake.
+    if (/^[A-Z2-9]{4}-?[A-Z2-9]{4}$/i.test(trackingInput.trim()) && !/^COL/i.test(trackingInput.trim())) {
+      setTrackingResult(null);
+      setErrorMessage(
+        'Ceci ressemble à un code d’activation de compte, pas à un numéro de suivi. Le numéro de suivi commence par « COL- » (ex : COL-2026-000004). Le code d’activation se saisit après la création de votre compte client, avec votre téléphone.'
+      );
+      return;
+    }
 
     setIsLoading(true);
     setErrorMessage(null);
@@ -84,7 +99,13 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
     return map[status] ?? 0;
   };
 
-  const currentStep = trackingResult ? getMilestoneIndex(trackingResult.status) : 0;
+  // ANOMALIE is not a stage of the route: flag it and keep the last stage reached.
+  const isAnomaly = trackingResult?.status === 'ANOMALIE';
+  const progressStatus = isAnomaly
+    ? [...(trackingResult?.statusHistory || [])].reverse().find((h: any) => h.status !== 'ANOMALIE')?.status || 'COMMANDE_CREEE'
+    : trackingResult?.status;
+  const currentStep = trackingResult ? getMilestoneIndex(progressStatus) : 0;
+  const lastEvent = trackingResult?.statusHistory?.[trackingResult.statusHistory.length - 1];
 
   return (
     <div className="max-w-4xl mx-auto space-y-6 pb-12 animate-in fade-in duration-200">
@@ -115,7 +136,7 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
           <input
             type="text"
             required
-            placeholder="Numéro de suivi du colis..."
+            placeholder="Ex : COL-2026-000004"
             value={trackingInput}
             onChange={(e) => setTrackingInput(e.target.value)}
             className="flex-1 px-4 py-3 text-sm rounded-xl bg-slate-800 border border-slate-700 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-500 font-mono tracking-wider"
@@ -131,7 +152,8 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
         </form>
 
         <div className="mt-3 text-[11px] text-slate-400 text-center">
-          Saisissez le numéro de suivi réel communiqué lors de l’enregistrement du colis.
+          Saisissez le <strong>numéro de suivi</strong> du colis (COL-…), inscrit sur l’étiquette et communiqué par l’agence.
+          Ce n’est ni votre nom ni le code d’activation de compte.
         </div>
       </div>
 
@@ -156,6 +178,17 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
                 {trackingResult.trackingNumber}
               </div>
               <div className="text-xs text-slate-600 mt-1">Suivi public : seuls le statut et la destination sont affichés.</div>
+              <div className="text-[11px] text-slate-500 mt-1 flex flex-wrap items-center gap-2">
+                {lastEvent && <span>Dernière mise à jour : {lastEvent.date} à {lastEvent.time}</span>}
+                <button
+                  type="button"
+                  onClick={() => handleSearch()}
+                  disabled={isLoading}
+                  className="font-bold text-amber-700 hover:underline disabled:opacity-50"
+                >
+                  {isLoading ? 'Actualisation…' : 'Actualiser'}
+                </button>
+              </div>
             </div>
 
             <div className="text-left sm:text-right">
@@ -178,6 +211,13 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
               </div>
             </div>
           </div>
+
+          {isAnomaly && (
+            <div className="bg-rose-50 border border-rose-200 text-rose-800 p-3 rounded-xl flex items-center gap-2 text-xs">
+              <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+              Une anomalie a été signalée sur ce colis. Contactez votre agence GZ Mubua Global pour plus d’informations.
+            </div>
+          )}
 
           {/* 9-Stage Visual Timeline Stepper */}
           <div className="py-2">

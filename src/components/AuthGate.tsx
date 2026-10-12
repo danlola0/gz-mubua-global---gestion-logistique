@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import type { Session } from '@supabase/supabase-js';
-import { Eye, EyeOff, KeyRound, LoaderCircle, Mail, ShieldCheck } from 'lucide-react';
+import { Eye, EyeOff, KeyRound, LoaderCircle, Mail, Package, Phone, ShieldCheck, UserPlus } from 'lucide-react';
 import type { User, UserRole } from '../types/index.ts';
 import { getSupabaseConfigError, supabaseClient } from '../services/supabaseClient.ts';
 import { SplashScreen } from './SplashScreen.tsx';
+import { PublicTrackingView } from '../views/PublicTrackingView.tsx';
+import { api } from '../services/api.ts';
 
 interface AuthGateProps {
   children: (user: User, signOut: () => Promise<void>) => React.ReactNode;
@@ -21,6 +23,7 @@ function toAppUser(row: any): User {
     agencyName: row.agency_name || '',
     status: row.status,
     createdAt: row.created_at ? String(row.created_at).split('T')[0] : '',
+    clientId: row.client_id || undefined,
   };
 }
 
@@ -46,6 +49,26 @@ function friendlyAuthError(message: string): string {
   return 'Connexion impossible pour le moment. Vérifiez vos identifiants et votre connexion, puis réessayez.';
 }
 
+function friendlySignUpError(message: string): string {
+  const normalized = message.toLowerCase();
+  if (normalized.includes('already registered') || normalized.includes('already exists')) {
+    return 'Cette adresse e-mail a déjà un compte. Connectez-vous avec, ou utilisez une autre adresse (un compte employé ne peut pas servir de compte client).';
+  }
+  if (normalized.includes('not authorized')) {
+    return 'L’envoi de l’e-mail de confirmation à cette adresse est bloqué par la configuration e-mail de Supabase. L’administrateur doit configurer un service d’envoi (SMTP) dans Supabase.';
+  }
+  if (normalized.includes('rate limit') || normalized.includes('too many')) {
+    return 'Trop d’e-mails envoyés récemment. Réessayez plus tard (limite d’envoi de Supabase).';
+  }
+  if (normalized.includes('password')) {
+    return 'Mot de passe refusé : choisissez un mot de passe plus robuste (8 caractères minimum).';
+  }
+  if (normalized.includes('invalid') && normalized.includes('email')) {
+    return 'Adresse e-mail invalide. Vérifiez l’orthographe.';
+  }
+  return `Création du compte impossible : ${message}`;
+}
+
 export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
   const [session, setSession] = useState<Session | null>(null);
   const [appUser, setAppUser] = useState<User | null>(null);
@@ -57,6 +80,18 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isResettingPassword, setIsResettingPassword] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // 'signup' = client self-registration, 'track' = public parcel tracking without login.
+  // A link like https://site/?suivi=COL-2026-000004 (sent by WhatsApp) opens the
+  // public tracking directly, with the number already searched.
+  const [sharedTracking] = useState(() => new URLSearchParams(window.location.search).get('suivi')?.trim() || '');
+  const [mode, setMode] = useState<'login' | 'signup' | 'track'>(sharedTracking ? 'track' : 'login');
+  const [fullName, setFullName] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  // Verified account without a profile yet: the client links it to their client file.
+  const [needsLink, setNeedsLink] = useState(false);
+  const [linkPhone, setLinkPhone] = useState('');
+  const [activationCode, setActivationCode] = useState('');
+  const [isLinking, setIsLinking] = useState(false);
 
   useEffect(() => {
     const client = supabaseClient;
@@ -66,6 +101,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
     const loadProfile = async (nextSession: Session | null) => {
       setSession(nextSession);
       setAppUser(null);
+      setNeedsLink(false);
       if (!nextSession) {
         setIsLoading(false);
         return;
@@ -80,9 +116,15 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
         );
         if (!active) return;
         const row = Array.isArray(data) ? data[0] : data;
-        if (profileError || !row) {
-          setError(profileError?.message || 'Aucun profil actif n’est associé à ce compte Auth. Vérifiez le profil public.users.');
+        if (profileError) {
+          setError(profileError.message);
           await client.auth.signOut();
+          if (active) setIsLoading(false);
+          return;
+        }
+        if (!row) {
+          // Signed in with a verified e-mail but not yet linked to a client file.
+          setNeedsLink(true);
           if (active) setIsLoading(false);
           return;
         }
@@ -173,6 +215,62 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
     }
   };
 
+  const handleSignUp = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabaseClient) return;
+    setError(null);
+    setNotice(null);
+    if (password.length < 8) {
+      setError('Le mot de passe doit contenir au moins 8 caractères.');
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError('Les deux mots de passe ne correspondent pas.');
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      const { error: signUpError } = await withTimeout(
+        supabaseClient.auth.signUp({
+          email: email.trim(),
+          password,
+          options: { emailRedirectTo: window.location.origin, data: { full_name: fullName.trim() } },
+        }),
+        'La création du compte prend trop de temps. Vérifiez votre connexion puis réessayez.'
+      );
+      if (signUpError) {
+        setError(friendlySignUpError(signUpError.message));
+        console.error('[Auth sign-up]', signUpError.message);
+        return;
+      }
+      // Same message whether or not the address already exists (no account enumeration).
+      setNotice('Un e-mail de confirmation vient d’être envoyé. Cliquez sur le lien reçu pour vérifier votre adresse, puis connectez-vous pour associer votre fiche client.');
+      setPassword('');
+      setConfirmPassword('');
+      setMode('login');
+    } catch (signUpError) {
+      setError(signUpError instanceof Error ? signUpError.message : 'Création du compte impossible.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleLinkAccount = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabaseClient) return;
+    setError(null);
+    setIsLinking(true);
+    try {
+      await api.linkClientAccount({ phone: linkPhone.trim(), activationCode: activationCode.trim() || undefined });
+      // Refreshing the session re-runs the profile lookup, which now succeeds.
+      await supabaseClient.auth.refreshSession();
+    } catch (linkError) {
+      setError(linkError instanceof Error ? linkError.message : 'Association impossible pour le moment.');
+    } finally {
+      setIsLinking(false);
+    }
+  };
+
   const handleSignOut = async () => {
     if (!supabaseClient) return;
     const { error: signOutError } = await supabaseClient.auth.signOut();
@@ -184,6 +282,17 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
   if (isLoading) return <SplashScreen message="Vérification sécurisée de votre session…" />;
   if (session && appUser) return <>{children(appUser, handleSignOut)}</>;
 
+  if (mode === 'track' && !session) {
+    return (
+      <main className="min-h-screen bg-slate-950 px-4 py-6 sm:px-6">
+        <PublicTrackingView onClose={() => setMode('login')} initialTracking={sharedTracking} />
+      </main>
+    );
+  }
+
+  const inputClass = 'w-full rounded-xl border border-slate-700 bg-slate-950/80 py-3 pl-3 pr-3 text-base text-white outline-none transition placeholder:text-slate-600 focus:border-amber-400 focus:ring-2 focus:ring-amber-400/15 disabled:opacity-60 sm:text-sm';
+  const primaryButtonClass = 'flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-400 to-orange-500 px-4 py-3 font-bold text-slate-950 shadow-lg shadow-amber-500/15 transition hover:from-amber-300 hover:to-orange-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900 disabled:cursor-wait disabled:opacity-60';
+
   return (
     <main className="relative isolate flex min-h-screen items-center justify-center overflow-hidden bg-[#07111f] px-4 py-8 text-white sm:px-6">
       <div className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
@@ -194,11 +303,72 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
         <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-amber-300 to-orange-600 text-2xl font-black text-slate-950 shadow-lg shadow-amber-500/20">GZ</div>
         <p className="flex items-center justify-center gap-2 text-[10px] font-bold uppercase tracking-[0.25em] text-amber-300"><ShieldCheck className="h-3.5 w-3.5" /> Accès sécurisé</p>
         <h1 className="mt-2 text-center text-2xl font-black tracking-tight">GZ MUBUA GLOBAL</h1>
-        <p className="mt-2 text-center text-sm text-slate-400">Connectez-vous à votre espace logistique.</p>
+        <p className="mt-2 text-center text-sm text-slate-400">
+          {session && needsLink
+            ? 'Associez votre compte à votre fiche client.'
+            : mode === 'signup'
+              ? 'Créez votre compte client.'
+              : 'Connectez-vous à votre espace logistique.'}
+        </p>
 
         {error && <div role="alert" aria-live="polite" className="mt-6 flex gap-2.5 rounded-xl border border-rose-400/25 bg-rose-500/10 p-3.5 text-sm leading-5 text-rose-200"><KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-rose-300" /><span>{error}</span></div>}
         {notice && <div role="status" aria-live="polite" className="mt-6 rounded-xl border border-emerald-400/25 bg-emerald-500/10 p-3.5 text-sm leading-5 text-emerald-200">{notice}</div>}
 
+        {session && needsLink ? (
+          <form onSubmit={handleLinkAccount} className="mt-6 space-y-4">
+            <p className="text-sm leading-5 text-slate-300">
+              Votre adresse <strong className="text-white">{session.user.email}</strong> est vérifiée. Pour retrouver vos colis,
+              saisissez le numéro de téléphone donné à notre agence. Si l’agence a enregistré une autre adresse e-mail
+              (ou aucune), saisissez aussi le <strong className="text-white">code d’activation</strong> qu’elle vous a remis.
+            </p>
+            <label className="block text-sm font-semibold text-slate-200">
+              Téléphone enregistré à l’agence
+              <span className="relative mt-1.5 block">
+                <Phone className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+                <input type="tel" required autoComplete="tel" value={linkPhone} onChange={(event) => setLinkPhone(event.target.value)} disabled={isLinking} placeholder="+243 81 234 5678" className={`${inputClass} pl-10`} />
+              </span>
+            </label>
+            <label className="block text-sm font-semibold text-slate-200">
+              Code d’activation <span className="font-normal text-slate-500">(si l’agence vous en a remis un)</span>
+              <input type="text" autoComplete="one-time-code" value={activationCode} onChange={(event) => setActivationCode(event.target.value.toUpperCase())} disabled={isLinking} placeholder="ABCD-2345" className={`${inputClass} mt-1.5 font-mono tracking-widest`} />
+            </label>
+            <button type="submit" disabled={isLinking} className={primaryButtonClass}>
+              {isLinking ? <><LoaderCircle className="h-4 w-4 animate-spin" /> Vérification…</> : 'Retrouver mes colis'}
+            </button>
+            <button type="button" onClick={() => void handleSignOut()} className="w-full text-center text-sm font-semibold text-slate-400 hover:text-amber-300">
+              Se déconnecter
+            </button>
+            <p className="text-center text-xs text-slate-500">Vous êtes un employé ? Demandez à l’administrateur d’activer votre profil.</p>
+          </form>
+        ) : mode === 'signup' ? (
+          <form onSubmit={handleSignUp} className="mt-6 space-y-4">
+            <label className="block text-sm font-semibold text-slate-200">
+              Nom complet
+              <input type="text" required autoComplete="name" value={fullName} onChange={(event) => setFullName(event.target.value)} disabled={isSubmitting} className={`${inputClass} mt-1.5`} />
+            </label>
+            <label className="block text-sm font-semibold text-slate-200">
+              Adresse e-mail
+              <span className="relative mt-1.5 block">
+                <Mail className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+                <input type="email" required autoComplete="email" inputMode="email" value={email} onChange={(event) => setEmail(event.target.value)} disabled={isSubmitting} placeholder="vous@exemple.com" className={`${inputClass} pl-10`} />
+              </span>
+            </label>
+            <label className="block text-sm font-semibold text-slate-200">
+              Mot de passe (8 caractères minimum)
+              <input type="password" required minLength={8} autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} disabled={isSubmitting} className={`${inputClass} mt-1.5`} />
+            </label>
+            <label className="block text-sm font-semibold text-slate-200">
+              Confirmer le mot de passe
+              <input type="password" required minLength={8} autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} disabled={isSubmitting} className={`${inputClass} mt-1.5`} />
+            </label>
+            <button type="submit" disabled={isSubmitting || !supabaseClient} className={primaryButtonClass}>
+              {isSubmitting ? <><LoaderCircle className="h-4 w-4 animate-spin" /> Création…</> : <><UserPlus className="h-4 w-4" /> Créer mon compte</>}
+            </button>
+            <button type="button" onClick={() => { setMode('login'); setError(null); }} className="w-full text-center text-sm font-semibold text-amber-300 hover:text-amber-200 hover:underline">
+              J’ai déjà un compte : me connecter
+            </button>
+          </form>
+        ) : (
         <form onSubmit={handleLogin} className="mt-6 space-y-4">
           <label className="block text-sm font-semibold text-slate-200">
             Adresse e-mail
@@ -227,7 +397,16 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
           <button type="submit" disabled={isSubmitting || isResettingPassword || !supabaseClient} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-amber-400 to-orange-500 px-4 py-3 font-bold text-slate-950 shadow-lg shadow-amber-500/15 transition hover:from-amber-300 hover:to-orange-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900 disabled:cursor-wait disabled:opacity-60">
             {isSubmitting ? <><LoaderCircle className="h-4 w-4 animate-spin" /> Vérification des identifiants…</> : 'Se connecter'}
           </button>
+          <div className="grid grid-cols-1 gap-2 pt-1 sm:grid-cols-2">
+            <button type="button" onClick={() => { setMode('signup'); setError(null); setNotice(null); }} className="flex min-h-10 items-center justify-center gap-1.5 rounded-xl border border-slate-700 px-3 text-sm font-semibold text-slate-200 transition hover:border-amber-400 hover:text-amber-300">
+              <UserPlus className="h-4 w-4" /> Créer mon compte client
+            </button>
+            <button type="button" onClick={() => { setMode('track'); setError(null); }} className="flex min-h-10 items-center justify-center gap-1.5 rounded-xl border border-slate-700 px-3 text-sm font-semibold text-slate-200 transition hover:border-amber-400 hover:text-amber-300">
+              <Package className="h-4 w-4" /> Suivre un colis
+            </button>
+          </div>
         </form>
+        )}
         <p className="mt-6 text-center text-xs text-slate-500">Votre espace logistique, sécurisé par GZ Mubua Global.</p>
       </section>
     </main>

@@ -116,7 +116,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
         phone: empPhone,
         jobTitle: empJobTitle,
         agencyId: empAgencyId,
-        agencyName: agency?.name || 'Agence GZ MUBUA',
+        agencyName: agency?.name || '',
         country: agency?.country || 'RDC',
         baseSalaryUSD: Number(empBaseUSD) || 600,
         preferredCurrency: empCurr,

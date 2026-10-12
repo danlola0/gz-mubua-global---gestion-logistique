@@ -16,6 +16,16 @@ import type {
   Currency,
 } from '../types/index.ts';
 import { supabaseClient } from './supabaseClient.ts';
+import { PARCEL_STATUSES } from '../types/index.ts';
+
+// Address sent to clients: always the public site, even when an agent works
+// from a local or preview copy of the app.
+export const PUBLIC_APP_URL = (import.meta.env.VITE_PUBLIC_APP_URL || 'https://gzmubuaglobal.web.app').replace(/\/$/, '');
+
+/** Public link that opens the tracking page with this number already searched (no account needed). */
+export function publicTrackingUrl(trackingNumber: string): string {
+  return `${PUBLIC_APP_URL}/?suivi=${encodeURIComponent(trackingNumber)}`;
+}
 
 const supabaseFunctionUrl = import.meta.env.VITE_SUPABASE_FUNCTIONS_URL ||
   `${(import.meta.env.VITE_SUPABASE_URL || '').replace(/\/$/, '')}/functions/v1/api`;
@@ -33,7 +43,15 @@ const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Resp
       headers.set('Authorization', `Bearer ${data.session.access_token}`);
     }
   }
-  const response = await nativeFetch(input, { ...init, headers });
+  let response: Response;
+  try {
+    response = await nativeFetch(input, { ...init, headers });
+  } catch {
+    // Network failure or CORS refusal: the browser only reports "Failed to fetch".
+    throw new Error(
+      `Impossible de joindre l’API Supabase depuis ${window.location.origin}. Vérifiez votre connexion internet ; si elle fonctionne, cette adresse n’est pas autorisée par l’API (APP_ORIGIN).`
+    );
+  }
   if (!response.ok) {
     const errorBody = await response.clone().json().catch(() => ({}));
     throw new Error(errorBody.error || `La requête Supabase a échoué (${response.status}).`);
@@ -77,6 +95,30 @@ export const api = {
   // Agencies
   async getAgencies(): Promise<Agency[]> {
     const res = await fetch(`${BASE_URL}/agencies`);
+    return res.json();
+  },
+
+  /** Links the signed-in (e-mail verified) account to the client file created by an agent. */
+  async linkClientAccount(data: { phone: string; activationCode?: string }): Promise<void> {
+    await fetch(`${BASE_URL}/client-accounts/link`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+  },
+
+  /** Issues a one-time activation code (valid 7 days) for a client to create an account. */
+  async createClientActivationCode(clientId: string): Promise<{ code: string; expiresAt: string }> {
+    const res = await fetch(`${BASE_URL}/clients/${clientId}/activation-code`, { method: 'POST' });
+    return res.json();
+  },
+
+  async createAgency(data: Partial<Agency>): Promise<Agency> {
+    const res = await fetch(`${BASE_URL}/agencies`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
     return res.json();
   },
 
@@ -489,6 +531,14 @@ export function formatUSD(amount?: number): string {
   return `${amount.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} $`;
 }
 
+/** "2026-10-12" (or an ISO timestamp) -> "12/10/2026"; returns the input if it is not a date. */
+export function formatDay(value?: string): string {
+  if (!value) return '';
+  const day = String(value).slice(0, 10);
+  const [y, m, d] = day.split('-');
+  return y && m && d ? `${d}/${m}/${y}` : String(value);
+}
+
 export function formatCurrency(amount: number, currency: Currency): string {
   if (currency === 'USD') return formatUSD(amount);
   if (currency === 'CNY') return `${amount.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ¥`;
@@ -499,13 +549,16 @@ export function formatCurrency(amount: number, currency: Currency): string {
 
 export function createWhatsAppTrackingLink(parcel: Parcel): string {
   const phone = (parcel.clientPhone || '').replace(/[^0-9]/g, '');
+  const statusLabel = PARCEL_STATUSES[parcel.status]?.label || parcel.status;
+  const volume = Number(parcel.volumeCbm) > 0 ? ` | Volume : ${parcel.volumeCbm} m³` : '';
   const text = encodeURIComponent(
-    `Bonjour ${parcel.clientName},\n\nVoici le statut de votre colis GZ MUBUA GLOBAL :\n` +
-      `📦 N° de Suivi : ${parcel.trackingNumber}\n` +
-      `📌 Destination : ${parcel.destination}\n` +
-      `🚀 Statut actuel : ${parcel.status}\n` +
-      `⚖️ Poids : ${parcel.weightKg} kg | Volume : ${parcel.volumeCbm} m³\n` +
+    `Bonjour ${parcel.clientName},\n\nVoici le suivi de votre colis GZ MUBUA GLOBAL :\n` +
+      `📦 N° de suivi : ${parcel.trackingNumber}\n` +
+      `📌 Destination : ${parcel.destinationAgencyName || parcel.destination}\n` +
+      `🚀 Statut actuel : ${statusLabel}\n` +
+      `⚖️ Poids : ${parcel.weightKg} kg${volume}\n` +
       `💰 Solde restant : ${formatUSD(parcel.remainingAmountUSD)}\n\n` +
+      `🔎 Suivez votre colis à tout moment (sans compte) :\n${publicTrackingUrl(parcel.trackingNumber)}\n\n` +
       `Merci pour votre confiance avec GZ MUBUA GLOBAL (Chine - Kinshasa - Angola) !`
   );
   return `https://wa.me/${phone}?text=${text}`;

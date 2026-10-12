@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   Settings,
   Globe,
@@ -8,8 +8,6 @@ import {
   CheckCircle2,
   DollarSign,
   Plus,
-  Database,
-  RefreshCw,
   Copy,
   ExternalLink,
   AlertCircle,
@@ -27,6 +25,7 @@ interface SettingsViewProps {
   users: User[];
   onUpdateRates: (rates: Partial<ExchangeRates>) => Promise<void>;
   onCreateUser: (userData: Partial<User>) => Promise<void>;
+  onCreateAgency: (agencyData: Partial<Agency>) => Promise<void>;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -35,14 +34,48 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   users,
   onUpdateRates,
   onCreateUser,
+  onCreateAgency,
 }) => {
+  const emptyAgency = {
+    name: '',
+    country: 'Chine' as Agency['country'],
+    city: '',
+    type: 'origin' as Agency['type'],
+    address: '',
+    phone: '',
+    email: '',
+    managerName: '',
+  };
+  const [showAgencyForm, setShowAgencyForm] = useState(false);
+  const [agencyForm, setAgencyForm] = useState(emptyAgency);
+  const [isCreatingAgency, setIsCreatingAgency] = useState(false);
+  const [agencyError, setAgencyError] = useState<string | null>(null);
+  const [agencySuccess, setAgencySuccess] = useState<string | null>(null);
+
+  const handleAgencySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAgencyError(null);
+    setAgencySuccess(null);
+    setIsCreatingAgency(true);
+    try {
+      await onCreateAgency(agencyForm);
+      setAgencySuccess(`Agence « ${agencyForm.name} » créée.`);
+      setAgencyForm(emptyAgency);
+      setShowAgencyForm(false);
+    } catch (err) {
+      setAgencyError(err instanceof Error ? err.message : 'Création de l’agence impossible.');
+    } finally {
+      setIsCreatingAgency(false);
+    }
+  };
+
   const [rates, setRates] = useState({
     CNY: exchangeRates.CNY,
     CDF: exchangeRates.CDF,
     AOA: exchangeRates.AOA,
   });
   const [freight, setFreight] = useState({
-    maritimePricePerKg: exchangeRates.maritimePricePerKg || 0,
+    maritimePricePerCbm: exchangeRates.maritimePricePerCbm || 0,
     aerienPricePerKg: exchangeRates.aerienPricePerKg || 0,
     freightRateCurrency: (exchangeRates.freightRateCurrency || 'USD') as Currency,
   });
@@ -50,62 +83,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [rateSuccess, setRateSuccess] = useState(false);
   const [rateError, setRateError] = useState<string | null>(null);
 
-  // Supabase Integration state
-  const [supabaseStatus, setSupabaseStatus] = useState<{
-    isConfigured: boolean;
-    url: string | null;
-    message: string;
-  }>({
-    isConfigured: false,
-    url: null,
-    message: 'Chargement...',
-  });
-  const [testResult, setTestResult] = useState<{ success: boolean; message: string; tablesStatus?: string } | null>(null);
-  const [isTesting, setIsTesting] = useState(false);
-
   // New user form state
   const [showUserModal, setShowUserModal] = useState(false);
   const [username, setUsername] = useState('');
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
+  // Agencies an operational role may be attached to (mirrors the API rule).
+  const agenciesForRole = (r: UserRole) =>
+    r === 'china_team'
+      ? agencies.filter((a) => a.country === 'Chine')
+      : r === 'kinshasa_team'
+        ? agencies.filter((a) => a.country === 'RDC' || a.country === 'Angola')
+        : agencies;
   const [role, setRole] = useState<UserRole>('kinshasa_team');
-  const [agencyId, setAgencyId] = useState(agencies[0]?.id || 'AG-GOMBE');
+  const [agencyId, setAgencyId] = useState(agenciesForRole('kinshasa_team')[0]?.id || '');
   const [isCreatingUser, setIsCreatingUser] = useState(false);
-
-  useEffect(() => {
-    loadSupabaseInfo();
-  }, []);
-
-  const loadSupabaseInfo = async () => {
-    try {
-      const status = await api.getSupabaseStatus();
-      setSupabaseStatus(status);
-    } catch (err) {
-      console.error('Error fetching Supabase status:', err);
-    }
-  };
-
-  const handleTestConnection = async () => {
-    setIsTesting(true);
-    setTestResult(null);
-    try {
-      const res = await api.testSupabase();
-      setTestResult(res);
-      await loadSupabaseInfo();
-    } catch (err: any) {
-      setTestResult({ success: false, message: err.message });
-    } finally {
-      setIsTesting(false);
-    }
-  };
+  const [userError, setUserError] = useState<string | null>(null);
 
 
   const handleRatesSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setRateSuccess(false);
     setRateError(null);
-    if ([freight.maritimePricePerKg, freight.aerienPricePerKg].some((v) => !Number.isFinite(Number(v)) || Number(v) < 0)) {
+    if ([freight.maritimePricePerCbm, freight.aerienPricePerKg].some((v) => !Number.isFinite(Number(v)) || Number(v) < 0)) {
       setRateError('Les tarifs par kg doivent être des nombres positifs ou nuls.');
       return;
     }
@@ -116,7 +117,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         CNY: Number(rates.CNY),
         CDF: Number(rates.CDF),
         AOA: Number(rates.AOA),
-        maritimePricePerKg: Number(freight.maritimePricePerKg),
+        maritimePricePerCbm: Number(freight.maritimePricePerCbm),
         aerienPricePerKg: Number(freight.aerienPricePerKg),
         freightRateCurrency: freight.freightRateCurrency,
       });
@@ -131,17 +132,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleUserSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const agency = agencies.find((a) => a.id === agencyId);
+    setUserError(null);
+    if (role !== 'admin' && !agencyId) {
+      setUserError('Une agence compatible avec ce rôle est obligatoire.');
+      return;
+    }
     setIsCreatingUser(true);
     try {
+      // The agency name is taken from Supabase by the API, not from the form.
       await onCreateUser({
         username,
         fullName,
         email,
         phone,
         role,
-        agencyId,
-        agencyName: agency?.name || 'Siège Kinshasa Gombe',
+        agencyId: agencyId || undefined,
         status: 'active',
       });
       setShowUserModal(false);
@@ -149,6 +154,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setFullName('');
       setEmail('');
       setPhone('');
+    } catch (err) {
+      setUserError(err instanceof Error ? err.message : 'Création du compte impossible.');
     } finally {
       setIsCreatingUser(false);
     }
@@ -163,44 +170,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <Settings className="w-5 h-5 text-amber-500" /> Paramètres Système & Intégrations
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Connexion PostgreSQL Supabase, gestion des devises (USD, CNY, CDF, AOA), hubs et habilitations RBAC.
+            Taux de change (USD, CNY, CDF, AOA), tarif du fret, agences et utilisateurs.
           </p>
         </div>
       </div>
 
-        {/* Supabase Edge Function status */}
-      <section className="rounded-2xl border border-slate-800 bg-slate-900 p-5 text-white shadow-xl">
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-emerald-500/40 bg-emerald-500/20 text-emerald-400">
-              <Database className="h-5 w-5" />
-            </div>
-            <div>
-              <h2 className="font-black">Supabase PostgreSQL + Edge Functions</h2>
-              <p className="mt-1 text-xs text-slate-300">
-                {supabaseStatus.url ? `Projet : ${supabaseStatus.url}` : 'État de la passerelle Supabase'}
-              </p>
-              <span className={`mt-2 inline-block rounded-full px-2.5 py-0.5 text-[10px] font-bold ${supabaseStatus.isConfigured ? 'bg-emerald-500/20 text-emerald-300' : 'bg-rose-500/20 text-rose-300'}`}>
-                {supabaseStatus.isConfigured ? 'Edge API configurée' : 'Edge API indisponible'}
-              </span>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={handleTestConnection}
-            disabled={isTesting}
-            className="flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-xs font-bold text-white transition hover:bg-emerald-500 disabled:opacity-50"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${isTesting ? 'animate-spin' : ''}`} />
-            {isTesting ? 'Vérification…' : 'Tester Supabase'}
-          </button>
-        </div>
-        {testResult && (
-          <p role="status" className={`mt-4 rounded-xl border p-3 text-xs ${testResult.success ? 'border-emerald-500/40 bg-emerald-950/40 text-emerald-200' : 'border-rose-500/40 bg-rose-950/40 text-rose-200'}`}>
-            {testResult.message}
-          </p>
-        )}
-      </section>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* 1. Multi-currency Rates */}
@@ -271,10 +245,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             <div className="p-3 bg-amber-50/60 rounded-xl border border-amber-200 space-y-2">
               <label className="block text-[11px] font-bold text-slate-700">
-                Tarif Fret Universel (par kg)
+                Tarifs du fret
               </label>
               <p className="text-[10px] text-slate-500">
-                Appliqué aux nouveaux colis uniquement. Les colis déjà enregistrés conservent leur tarif.
+                Aérien : facturé au poids (kg). Maritime : facturé au volume (CBM = m³). Appliqués aux nouveaux colis uniquement ; les colis déjà enregistrés conservent leur tarif.
               </p>
               <div className="flex items-center gap-2">
                 <span className="w-24 text-slate-700 font-bold flex items-center gap-1">
@@ -285,11 +259,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   step="0.01"
                   min="0"
                   required
-                  value={freight.maritimePricePerKg}
-                  onChange={(e) => setFreight({ ...freight, maritimePricePerKg: Number(e.target.value) })}
+                  value={freight.maritimePricePerCbm}
+                  onChange={(e) => setFreight({ ...freight, maritimePricePerCbm: Number(e.target.value) })}
                   className="w-32 p-2 rounded-lg border border-slate-300 font-mono font-bold bg-white"
                 />
-                <span className="text-slate-700 font-bold">{freight.freightRateCurrency} / kg</span>
+                <span className="text-slate-700 font-bold">{freight.freightRateCurrency} / CBM (m³)</span>
               </div>
               <div className="flex items-center gap-2">
                 <span className="w-24 text-slate-700 font-bold flex items-center gap-1">
@@ -352,7 +326,143 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <h2 className="text-sm font-bold uppercase tracking-wider text-slate-800 flex items-center gap-2">
               <Building2 className="w-4 h-4 text-amber-600" /> Réseau d'Agences & Hubs ({agencies.length})
             </h2>
+            {!showAgencyForm && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowAgencyForm(true);
+                  setAgencySuccess(null);
+                }}
+                className="flex items-center gap-1 px-3 py-1.5 text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition"
+              >
+                <Plus className="w-3.5 h-3.5" /> Ajouter
+              </button>
+            )}
           </div>
+
+          {agencySuccess && (
+            <p role="status" className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+              {agencySuccess}
+            </p>
+          )}
+
+          {showAgencyForm && (
+            <form onSubmit={handleAgencySubmit} className="p-3 bg-amber-50/60 rounded-xl border border-amber-200 space-y-3 text-xs">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">Nom de l’agence *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ex : GZ MUBUA Hub Guangzhou"
+                    value={agencyForm.name}
+                    onChange={(e) => setAgencyForm({ ...agencyForm, name: e.target.value })}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">Pays *</label>
+                  <select
+                    value={agencyForm.country}
+                    onChange={(e) => {
+                      const country = e.target.value as Agency['country'];
+                      setAgencyForm({ ...agencyForm, country, type: country === 'Chine' ? 'origin' : 'destination' });
+                    }}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  >
+                    <option value="Chine">Chine</option>
+                    <option value="RDC">RDC</option>
+                    <option value="Angola">Angola</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">Ville *</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ex : Guangzhou"
+                    value={agencyForm.city}
+                    onChange={(e) => setAgencyForm({ ...agencyForm, city: e.target.value })}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">Rôle</label>
+                  <select
+                    value={agencyForm.type}
+                    onChange={(e) => setAgencyForm({ ...agencyForm, type: e.target.value as Agency['type'] })}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  >
+                    <option value="origin">Origine (réception Chine)</option>
+                    <option value="destination">Destination (retrait client)</option>
+                    <option value="hub">Hub</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">Téléphone</label>
+                  <input
+                    type="text"
+                    value={agencyForm.phone}
+                    onChange={(e) => setAgencyForm({ ...agencyForm, phone: e.target.value })}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">Adresse</label>
+                  <input
+                    type="text"
+                    value={agencyForm.address}
+                    onChange={(e) => setAgencyForm({ ...agencyForm, address: e.target.value })}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">E-mail</label>
+                  <input
+                    type="email"
+                    value={agencyForm.email}
+                    onChange={(e) => setAgencyForm({ ...agencyForm, email: e.target.value })}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">Responsable</label>
+                  <input
+                    type="text"
+                    value={agencyForm.managerName}
+                    onChange={(e) => setAgencyForm({ ...agencyForm, managerName: e.target.value })}
+                    className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+              </div>
+
+              {agencyError && (
+                <p role="alert" className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                  {agencyError}
+                </p>
+              )}
+
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowAgencyForm(false);
+                    setAgencyError(null);
+                  }}
+                  className="px-3 py-2 font-semibold text-slate-600 hover:bg-slate-100 rounded-lg transition"
+                >
+                  Annuler
+                </button>
+                <button
+                  type="submit"
+                  disabled={isCreatingAgency}
+                  className="px-4 py-2 font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition disabled:opacity-50"
+                >
+                  {isCreatingAgency ? 'Création...' : 'Créer l’agence'}
+                </button>
+              </div>
+            </form>
+          )}
 
           <div className="space-y-3">
             {agencies.map((a) => (
@@ -363,10 +473,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     {a.country}
                   </span>
                 </div>
-                <p className="text-slate-600 mt-1">{a.address}</p>
-                <div className="mt-2 flex items-center justify-between text-[11px] text-slate-500">
-                  <span>Tél : {a.phone}</span>
-                  <span>Resp : {a.managerName}</span>
+                <p className="text-slate-600 mt-1">{[a.city, a.address].filter(Boolean).join(' • ')}</p>
+                <div className="mt-2 flex flex-wrap items-center justify-between gap-1 text-[11px] text-slate-500">
+                  <span>Tél : {a.phone || '—'}</span>
+                  <span>Resp : {a.managerName || '—'}</span>
                 </div>
               </div>
             ))}
@@ -483,31 +593,55 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <label className="block font-semibold mb-1">Rôle</label>
                   <select
                     value={role}
-                    onChange={(e) => setRole(e.target.value as UserRole)}
+                    required
+                    onChange={(e) => {
+                      const nextRole = e.target.value as UserRole;
+                      setRole(nextRole);
+                      const first = agenciesForRole(nextRole)[0];
+                      setAgencyId(nextRole === 'admin' ? '' : first?.id || '');
+                    }}
                     className="w-full p-2 rounded-lg border border-slate-300"
                   >
-                    <option value="admin">Administrateur</option>
+                    <option value="admin">Administrateur général</option>
                     <option value="china_team">Équipe Chine</option>
-                    <option value="kinshasa_team">Équipe Kinshasa</option>
+                    <option value="kinshasa_team">Équipe Kinshasa / destination</option>
                     <option value="cashier">Caissier</option>
-                    <option value="client">Client</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block font-semibold mb-1">Agence</label>
+                  <label className="block font-semibold mb-1">
+                    Agence {role === 'admin' ? '(facultatif)' : '*'}
+                  </label>
                   <select
                     value={agencyId}
+                    required={role !== 'admin'}
                     onChange={(e) => setAgencyId(e.target.value)}
                     className="w-full p-2 rounded-lg border border-slate-300"
                   >
-                    {agencies.map((a) => (
+                    {role === 'admin' && <option value="">Toutes les agences</option>}
+                    {role !== 'admin' && agenciesForRole(role).length === 0 && (
+                      <option value="">Aucune agence compatible : créez-la d’abord</option>
+                    )}
+                    {agenciesForRole(role).map((a) => (
                       <option key={a.id} value={a.id}>
-                        {a.name}
+                        {a.name} ({a.country})
                       </option>
                     ))}
                   </select>
                 </div>
               </div>
+              <p className="text-[11px] text-slate-500">
+                {role === 'admin' && 'Accès à toutes les agences, tableaux de bord et paramètres.'}
+                {role === 'china_team' && 'Accès uniquement aux colis et expéditions de l’agence chinoise choisie.'}
+                {role === 'kinshasa_team' && 'Accès uniquement aux colis et expéditions destinés à l’agence choisie.'}
+                {role === 'cashier' && 'Accès uniquement à la caisse et aux dépenses de l’agence choisie.'}
+                {' '}Les clients créent eux-mêmes leur compte (« Créer mon compte client »).
+              </p>
+              {userError && (
+                <p role="alert" className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-rose-700">
+                  {userError}
+                </p>
+              )}
               <div className="flex justify-end gap-2 pt-2 border-t">
                 <button
                   type="button"

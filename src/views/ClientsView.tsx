@@ -12,7 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import type { Client, Parcel, Payment, UserRole } from '../types/index.ts';
-import { formatUSD } from '../services/api.ts';
+import { formatUSD, PUBLIC_APP_URL } from '../services/api.ts';
 
 interface ClientsViewProps {
   clients: Client[];
@@ -22,6 +22,7 @@ interface ClientsViewProps {
   userName: string;
   userId: string;
   onCreateClient: (data: any) => Promise<void>;
+  onCreateActivationCode?: (clientId: string) => Promise<{ code: string; expiresAt: string }>;
   onSelectParcel: (parcel: Parcel) => void;
   onOpenPaymentForParcel: (parcel: Parcel) => void;
 }
@@ -34,11 +35,30 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
   userName,
   userId,
   onCreateClient,
+  onCreateActivationCode,
   onSelectParcel,
   onOpenPaymentForParcel,
 }) => {
   const [search, setSearch] = useState('');
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
+  // One-time code the agent hands to the client so they can create their account.
+  const [activation, setActivation] = useState<{ clientId: string; code: string; expiresAt: string } | null>(null);
+  const [activationError, setActivationError] = useState<string | null>(null);
+  const [isIssuingCode, setIsIssuingCode] = useState(false);
+
+  const handleIssueActivationCode = async (client: Client) => {
+    if (!onCreateActivationCode) return;
+    setActivationError(null);
+    setIsIssuingCode(true);
+    try {
+      const result = await onCreateActivationCode(client.id);
+      setActivation({ clientId: client.id, ...result });
+    } catch (err) {
+      setActivationError(err instanceof Error ? err.message : 'Impossible de générer le code.');
+    } finally {
+      setIsIssuingCode(false);
+    }
+  };
   const [showNewModal, setShowNewModal] = useState(false);
 
   // New Client Form
@@ -175,7 +195,8 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
                 </span>
               </div>
 
-              {/* Financial overview */}
+              {/* Financial overview (not sent by the API to operations teams) */}
+              {client.totalPaidUSD !== undefined && (
               <div className="grid grid-cols-2 gap-2 mt-4 p-2.5 rounded-xl bg-slate-50 border border-slate-100 text-xs">
                 <div>
                   <span className="text-[10px] text-slate-700 block uppercase font-bold">Total Payé</span>
@@ -194,6 +215,7 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
                   </span>
                 </div>
               </div>
+              )}
             </div>
 
             <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between">
@@ -235,8 +257,54 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
 
             {/* Content */}
             <div className="p-6 overflow-y-auto space-y-6 text-xs">
-              {/* Financial Summary */}
-              <div className="grid grid-cols-3 gap-3 text-center">
+              {/* Online account: activation code for the client's self-registration */}
+              {userRole !== 'client' && (
+                <div className="p-3 rounded-xl border border-indigo-200 bg-indigo-50 space-y-2">
+                  {selectedClient.hasAccount ? (
+                    <p className="font-semibold text-indigo-900">
+                      ✓ Ce client a créé son compte en ligne : il suit ses colis depuis son espace personnel.
+                    </p>
+                  ) : activation && activation.clientId === selectedClient.id ? (
+                    <div className="space-y-1.5 text-indigo-900">
+                      <p>Code d’activation à remettre au client (valable jusqu’au {new Date(activation.expiresAt).toLocaleDateString('fr-FR')}, usage unique) :</p>
+                      <p className="font-mono font-black text-lg tracking-widest">{activation.code}</p>
+                      <p className="text-[11px]">
+                        Le client clique sur « Créer mon compte client », confirme son e-mail, puis saisit ce code et son téléphone ({selectedClient.phone}).
+                      </p>
+                      <a
+                        href={`https://wa.me/${selectedClient.phone.replace(/\D/g, '')}?text=${encodeURIComponent(
+                          `Bonjour ${selectedClient.fullName}, votre code d’activation GZ MUBUA GLOBAL est ${activation.code} (valable 7 jours). Créez votre compte sur ${PUBLIC_APP_URL} avec « Créer mon compte client ».`
+                        )}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-block px-3 py-1.5 rounded-lg bg-emerald-600 text-white font-bold"
+                      >
+                        Envoyer par WhatsApp
+                      </a>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-indigo-900">
+                        Pas encore de compte en ligne.{' '}
+                        {selectedClient.email
+                          ? 'Le client peut s’inscrire avec l’e-mail enregistré, ou avec un code.'
+                          : 'Aucun e-mail enregistré : un code d’activation est nécessaire.'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleIssueActivationCode(selectedClient)}
+                        disabled={isIssuingCode || !onCreateActivationCode}
+                        className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold disabled:opacity-50"
+                      >
+                        {isIssuingCode ? 'Génération…' : 'Générer un code d’activation'}
+                      </button>
+                    </div>
+                  )}
+                  {activationError && <p className="text-rose-700 font-semibold">{activationError}</p>}
+                </div>
+              )}
+              {/* Financial Summary (hidden when the API does not send balances for this role) */}
+              <div className={`grid grid-cols-3 gap-3 text-center ${selectedClient.totalPaidUSD === undefined ? 'hidden' : ''}`}>
                 <div className="p-3 rounded-xl bg-slate-50 border">
                   <span className="text-[10px] text-slate-400 uppercase block">Total Facturé</span>
                   <span className="font-black text-sm text-slate-900">

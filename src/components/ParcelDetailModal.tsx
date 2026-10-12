@@ -24,8 +24,8 @@ import {
 } from 'lucide-react';
 import type { Parcel, ParcelStatus, UserRole } from '../types/index.ts';
 import { PARCEL_STATUSES } from '../types/index.ts';
-import { formatUSD, formatCurrency, createWhatsAppTrackingLink } from '../services/api.ts';
-import { roundMoney } from '../../supabase/functions/_shared/parcelPricing.ts';
+import { formatUSD, formatCurrency, formatDay, createWhatsAppTrackingLink } from '../services/api.ts';
+import { roundMoney, volumeFromDimensionsCm } from '../../supabase/functions/_shared/parcelPricing.ts';
 
 interface ParcelDetailModalProps {
   parcel: Parcel | null;
@@ -91,13 +91,23 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
   const [editWeight, setEditWeight] = useState(parcel.weightKg);
   const [editSupplier, setEditSupplier] = useState(parcel.supplier || '');
   const [editCost, setEditCost] = useState(parcel.transportCostUSD || 0);
+  const [editLength, setEditLength] = useState<number | ''>(parcel.lengthCm ?? '');
+  const [editWidth, setEditWidth] = useState<number | ''>(parcel.widthCm ?? '');
+  const [editHeight, setEditHeight] = useState<number | ''>(parcel.heightCm ?? '');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
-  // Parcels priced with the universal tariff keep their frozen per-kg rate.
-  const snapshotPricePerKg = Number(parcel.pricePerKg) || 0;
+  // Parcels keep the basis and tariff frozen at registration: air per kg, sea per CBM.
+  // (Parcels priced before CBM pricing have no pricingUnit: kg when a kg tariff was frozen.)
+  const pricingUnit = parcel.pricingUnit || (Number(parcel.pricePerKg) > 0 ? 'KG' : undefined);
+  const frozenUnitPrice =
+    pricingUnit === 'CBM' ? Number(parcel.pricePerCbm) || 0 : pricingUnit === 'KG' ? Number(parcel.pricePerKg) || 0 : 0;
   const snapshotRate = Number(parcel.pricingExchangeRate) || 1;
   const pricingCurrency = parcel.pricingCurrency || 'USD';
+  const unitLabel = pricingUnit === 'CBM' ? 'CBM' : 'kg';
+  const editVolume = volumeFromDimensionsCm(editLength, editWidth, editHeight);
   const editComputedCostUSD =
-    snapshotPricePerKg > 0 ? roundMoney(roundMoney((Number(editWeight) || 0) * snapshotPricePerKg) / snapshotRate) : null;
+    frozenUnitPrice > 0
+      ? roundMoney(roundMoney((pricingUnit === 'CBM' ? editVolume ?? 0 : Number(editWeight) || 0) * frozenUnitPrice) / snapshotRate)
+      : null;
 
   const handleDeleteSubmit = async () => {
     if (!onDeleteParcel) return;
@@ -117,7 +127,12 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!onUpdateParcel) return;
-    if (!(Number(editWeight) > 0)) {
+    if (pricingUnit === 'CBM') {
+      if (editVolume === null) {
+        alert('Erreur modification: saisissez la longueur, la largeur et la hauteur (en cm, supérieures à 0).');
+        return;
+      }
+    } else if (!(Number(editWeight) > 0)) {
       alert('Erreur modification: le poids doit être supérieur à 0 kg.');
       return;
     }
@@ -129,9 +144,11 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
     try {
       await onUpdateParcel(parcel.id, {
         description: editDesc,
-        weightKg: Number(editWeight),
+        ...(pricingUnit === 'CBM'
+          ? { lengthCm: Number(editLength), widthCm: Number(editWidth), heightCm: Number(editHeight) }
+          : { weightKg: Number(editWeight) }),
         supplier: editSupplier,
-        // With a frozen tariff the server recomputes the freight from the weight.
+        // With a frozen tariff the server recomputes the freight (weight or volume).
         ...(editComputedCostUSD === null ? { transportCostUSD: Number(editCost) || 0 } : {}),
       });
       setIsEditing(false);
@@ -521,6 +538,18 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
                       <span className="text-slate-400 block text-[10px]">Fournisseur / Vendeur</span>
                       <p className="font-semibold text-slate-900">{parcel.supplier}</p>
                     </div>
+                    {parcel.chinaReceptionDate && (
+                      <div>
+                        <span className="text-slate-400 block text-[10px]">Date de réception du colis</span>
+                        <p className="font-semibold text-slate-900">{formatDay(parcel.chinaReceptionDate)}</p>
+                      </div>
+                    )}
+                    {parcel.senderClientName && (
+                      <div>
+                        <span className="text-slate-400 block text-[10px]">Expéditeur (client enregistré)</span>
+                        <p className="font-semibold text-slate-900">{parcel.senderClientName}</p>
+                      </div>
+                    )}
                     {parcel.purchaseInfo && (
                       <div>
                         <span className="text-slate-400 block text-[10px]">Informations d'Achat</span>
@@ -590,11 +619,13 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
                   </div>
 
                   <div className="space-y-2 text-xs">
-                    {snapshotPricePerKg > 0 && (
+                    {frozenUnitPrice > 0 && (
                       <div className="flex justify-between">
                         <span className="text-slate-600">Tarif appliqué ({parcel.transportMode === 'AERIEN' ? 'aérien' : 'maritime'}) :</span>
                         <span className="font-semibold text-slate-900">
-                          {parcel.weightKg} kg × {formatCurrency(snapshotPricePerKg, pricingCurrency)}/kg
+                          {pricingUnit === 'CBM'
+                            ? `${Number(parcel.volumeCbm).toLocaleString('fr-FR', { maximumFractionDigits: 3 })} m³ × ${formatCurrency(frozenUnitPrice, pricingCurrency)}/CBM`
+                            : `${parcel.weightKg} kg × ${formatCurrency(frozenUnitPrice, pricingCurrency)}/kg`}
                         </span>
                       </div>
                     )}
@@ -787,19 +818,53 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
                 />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block font-semibold text-slate-700 mb-1">Poids réel (kg)</label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0.01"
-                    value={editWeight}
-                    onChange={(e) => setEditWeight(Number(e.target.value))}
-                    className="w-full p-2 border rounded-xl"
-                    required
-                  />
+              {pricingUnit === 'CBM' && (
+                <div className="grid grid-cols-3 gap-2">
+                  {([
+                    ['Longueur (cm)', editLength, setEditLength],
+                    ['Largeur (cm)', editWidth, setEditWidth],
+                    ['Hauteur (cm)', editHeight, setEditHeight],
+                  ] as const).map(([label, value, setter]) => (
+                    <div key={label}>
+                      <label className="block font-semibold text-slate-700 mb-1">{label}</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        value={value}
+                        onChange={(e) => setter(e.target.value === '' ? '' : Number(e.target.value))}
+                        className="w-full p-2 border rounded-xl"
+                        required
+                      />
+                    </div>
+                  ))}
                 </div>
+              )}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {pricingUnit === 'CBM' ? (
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Volume (CBM = m³)</label>
+                    <input
+                      type="text"
+                      readOnly
+                      value={editVolume !== null ? editVolume.toLocaleString('fr-FR', { minimumFractionDigits: 3 }) : '—'}
+                      className="w-full p-2 border rounded-xl bg-amber-50 font-mono"
+                    />
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Poids réel (kg)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0.01"
+                      value={editWeight}
+                      onChange={(e) => setEditWeight(Number(e.target.value))}
+                      className="w-full p-2 border rounded-xl"
+                      required
+                    />
+                  </div>
+                )}
                 <div>
                   <label className="block font-semibold text-slate-700 mb-1">Coût transport ($)</label>
                   {editComputedCostUSD !== null ? (
@@ -807,7 +872,7 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
                       type="text"
                       readOnly
                       value={formatUSD(editComputedCostUSD)}
-                      title={`Tarif figé : ${formatCurrency(snapshotPricePerKg, pricingCurrency)}/kg`}
+                      title={`Tarif figé : ${formatCurrency(frozenUnitPrice, pricingCurrency)}/${unitLabel}`}
                       className="w-full p-2 border rounded-xl bg-slate-100"
                     />
                   ) : (

@@ -46,8 +46,8 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
 
   // Quick dispatch modal state
   const [dispatchParcelId, setDispatchParcelId] = useState<string | null>(null);
-  const [driverName, setDriverName] = useState('Christian Bakole');
-  const [driverPhone, setDriverPhone] = useState('+243 81 777 6655');
+  const [driverName, setDriverName] = useState('');
+  const [driverPhone, setDriverPhone] = useState('');
 
   // Quick delivery confirmation state
   const [deliveryModalParcelId, setDeliveryModalParcelId] = useState<string | null>(null);
@@ -55,7 +55,7 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
 
   // Quick warehouse storage state
   const [storageParcelId, setStorageParcelId] = useState<string | null>(null);
-  const [storageLocation, setStorageLocation] = useState('Rayon Hangar Limete A-02');
+  const [storageLocation, setStorageLocation] = useState('');
 
   // Incoming shipments from China (in transit or departed)
   const incomingShipments = shipments.filter(
@@ -102,6 +102,10 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
     try {
       await onDispatchDelivery(dispatchParcelId, driverName, driverPhone);
       setDispatchParcelId(null);
+      setDriverName('');
+      setDriverPhone('');
+    } catch (err) {
+      alert(`Échec : ${err instanceof Error ? err.message : 'opération impossible'}`);
     } finally {
       setActionLoading(null);
     }
@@ -114,6 +118,9 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
     try {
       await onConfirmDelivered(deliveryModalParcelId, recipientName);
       setDeliveryModalParcelId(null);
+      setRecipientName('');
+    } catch (err) {
+      alert(`Échec : ${err instanceof Error ? err.message : 'opération impossible'}`);
     } finally {
       setActionLoading(null);
     }
@@ -126,6 +133,9 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
     try {
       await onMarkParcelReady(storageParcelId, storageLocation);
       setStorageParcelId(null);
+      setStorageLocation('');
+    } catch (err) {
+      alert(`Échec : ${err instanceof Error ? err.message : 'opération impossible'}`);
     } finally {
       setActionLoading(null);
     }
@@ -530,6 +540,7 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
                   type="text"
                   required
                   value={storageLocation}
+                  placeholder="Ex : Rayon A-02"
                   onChange={(e) => setStorageLocation(e.target.value)}
                   className="w-full text-xs p-2 rounded-lg border border-slate-300"
                 />
@@ -571,6 +582,7 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
                   type="text"
                   required
                   value={driverName}
+                  placeholder="Nom du livreur"
                   onChange={(e) => setDriverName(e.target.value)}
                   className="w-full text-xs p-2 rounded-lg border border-slate-300"
                 />
@@ -583,6 +595,7 @@ export const KinshasaOperationsView: React.FC<KinshasaOperationsViewProps> = ({
                   type="text"
                   required
                   value={driverPhone}
+                  placeholder="Téléphone du livreur"
                   onChange={(e) => setDriverPhone(e.target.value)}
                   className="w-full text-xs p-2 rounded-lg border border-slate-300"
                 />

@@ -1,14 +1,24 @@
 import { createClient } from 'npm:@supabase/supabase-js@2';
-import { computeParcelPricing, currencyRate, isPricingCurrency, roundMoney } from '../_shared/parcelPricing.ts';
+import { basisForMode, computeParcelPricing, currencyRate, isPricingCurrency, roundMoney, volumeFromDimensionsCm } from '../_shared/parcelPricing.ts';
 
 type Role = 'admin' | 'china_team' | 'kinshasa_team' | 'cashier' | 'client';
-type Profile = { id: string; username: string; full_name: string; email: string; phone: string; role: Role; agency_id: string | null; agency_name: string | null; status: string };
+type Profile = { id: string; username: string; full_name: string; email: string; phone: string; role: Role; agency_id: string | null; agency_name: string | null; status: string; client_id?: string | null };
 
+// Access-Control-Allow-Origin is added per request in Deno.serve (see allowOrigin).
 const corsHeaders = {
-  'Access-Control-Allow-Origin': Deno.env.get('APP_ORIGIN') || '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
 };
+// APP_ORIGIN may list several comma-separated origins, with "*" wildcards
+// (e.g. Firebase preview channels "https://site--*.web.app"); unset means any origin.
+const allowedOrigins = (Deno.env.get('APP_ORIGIN') || '').split(',').map((o) => o.trim()).filter(Boolean);
+const originPatterns = allowedOrigins.map(
+  (o) => new RegExp('^' + o.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[a-z0-9-]+') + '$', 'i')
+);
+function allowOrigin(requestOrigin: string | null) {
+  if (allowedOrigins.length === 0) return '*';
+  return requestOrigin && originPatterns.some((pattern) => pattern.test(requestOrigin)) ? requestOrigin : allowedOrigins[0];
+}
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status,
   headers: { ...corsHeaders, 'Content-Type': 'application/json; charset=utf-8' },
@@ -23,7 +33,7 @@ const nowTime = () => new Date().toISOString().slice(11, 16);
 const id = (prefix: string) => `${prefix}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 const allowed: Record<string, Record<string, Role[]>> = {
   users: { GET: ['admin'], POST: ['admin'], PUT: ['admin'], DELETE: ['admin'] },
-  agencies: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'] },
+  agencies: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'], POST: ['admin'] },
   'exchange-rates': { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'], PUT: ['admin'] },
   stats: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier'] },
   'audit-logs': { GET: ['admin'] },
@@ -80,8 +90,17 @@ async function notify(type: string, title: string, message: string, targetRole =
   if (error) throw error;
 }
 
-async function list(table: string, order = 'created_at'): Promise<any[]> {
-  const { data, error } = await db.from(table).select('*').order(order, { ascending: false });
+// Reads made for a user go through `scoped` (that user's JWT) so Postgres RLS
+// decides which rows they may see; `db` (service_role) is for writes and checks.
+function scopedClient(token: string) {
+  return createClient(supabaseUrl, anonKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+}
+
+async function list(table: string, order = 'created_at', client: any = db): Promise<any[]> {
+  const { data, error } = await client.from(table).select('*').order(order, { ascending: false });
   if (error) throw error;
   return (data || []).map(fromRow);
 }
@@ -106,10 +125,32 @@ function ratesResponse(row: any) {
     CDF: Number(row?.cdf_rate) || 2850,
     AOA: Number(row?.aoa_rate) || 920,
     lastUpdated: row?.last_updated || today(),
-    maritimePricePerKg: Number(row?.maritime_price_per_kg) || 0,
+    maritimePricePerKg: Number(row?.maritime_price_per_kg) || 0, // historique (avant le calcul au CBM)
+    maritimePricePerCbm: Number(row?.maritime_price_per_cbm) || 0,
     aerienPricePerKg: Number(row?.aerien_price_per_kg) || 0,
     freightRateCurrency: isPricingCurrency(row?.freight_rate_currency) ? row.freight_rate_currency : 'USD',
   };
+}
+
+async function loadAgency(agencyId: string | null, label: string): Promise<{ id: string; name: string; country: string; type: string } | null> {
+  if (!agencyId) return null;
+  const { data, error } = await db.from('agencies').select('id,name,country,type').eq('id', agencyId).maybeSingle();
+  if (error) throw error;
+  if (!data) throw new ApiError(400, `${label} introuvable (${agencyId}). Sélectionnez une agence existante.`);
+  return data;
+}
+
+// Staff accounts: role is mandatory; operational roles must be attached to a
+// matching agency (China team -> China agency, Kinshasa team -> RDC/Angola agency).
+async function resolveStaffAgency(role: unknown, agencyId: unknown) {
+  if (!['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'].includes(String(role))) throw new ApiError(400, 'Rôle utilisateur invalide.');
+  if (role === 'client') throw new ApiError(400, 'Les comptes clients sont créés par les clients eux-mêmes (« Créer mon compte client ») puis associés à leur fiche.');
+  const agency = await loadAgency(agencyId ? String(agencyId) : null, 'Agence');
+  if (role === 'admin') return agency;
+  if (!agency) throw new ApiError(400, 'Une agence est obligatoire pour ce rôle.');
+  if (role === 'china_team' && agency.country !== 'Chine') throw new ApiError(400, 'L’équipe Chine doit être rattachée à une agence située en Chine.');
+  if (role === 'kinshasa_team' && !['RDC', 'Angola'].includes(agency.country)) throw new ApiError(400, 'L’équipe de destination doit être rattachée à une agence en RDC ou en Angola.');
+  return agency;
 }
 
 async function assertExists(table: string, recordId: string | null, label: string) {
@@ -161,10 +202,18 @@ async function recalculateParcel(parcelId: string) {
   await refreshClient(parcel.client_id);
 }
 
-async function calculateStats() {
-  const [parcels, shipments, payments, expenses, clients, salaries] = await Promise.all([
-    list('parcels'), list('shipments'), list('payments'), list('expenses'), list('clients'), list('salary_payments'),
+// Statistics are computed from the rows RLS lets this user read: each role and
+// agency sees only its own figures; only the admin gets company-wide totals.
+async function calculateStats(client: any, actor: Profile) {
+  const [parcels, shipments, payments, expenses, allClients, salaries] = await Promise.all([
+    list('parcels', 'created_at', client), list('shipments', 'created_at', client), list('payments', 'created_at', client),
+    list('expenses', 'created_at', client), list('clients', 'created_at', client), list('salary_payments', 'payment_date', client),
   ]);
+  // Outside the admin, client counters are limited to clients of the visible parcels/payments.
+  const scopedClientIds = new Set([...parcels.map((p) => p.clientId), ...payments.map((p) => p.clientId)].filter(Boolean));
+  const clients = actor.role === 'admin' ? allClients : allClients.filter((c) => scopedClientIds.has(c.id));
+  const clientPaid = actor.role === 'admin' ? null : payments.reduce((t, p) => t + Number(p.amountUSD || 0), 0);
+  const clientRemaining = actor.role === 'admin' ? null : parcels.reduce((t, p) => t + Number(p.remainingAmountUSD || 0), 0);
   const count = (items: any[], statuses: string[]) => items.filter((item) => statuses.includes(item.status)).length;
   const sum = (items: any[], key: string) => items.reduce((total, item) => total + Number(item[key] || 0), 0);
   const byCurrency = (currency: string) => sum(payments.filter((p) => p.currency === currency), 'originalAmount') - sum(expenses.filter((e) => e.currency === currency), 'originalAmount');
@@ -173,9 +222,138 @@ async function calculateStats() {
   return {
     parcels: { total: parcels.length, inChina: count(parcels, ['COMMANDE_CREEE', 'ATTENTE_RECEPTION_CHINE', 'RECU_CHINE', 'IDENTIFIE', 'CONTROLE', 'PREPARE_EXPEDITION', 'EXPEDITION_EN_PREPARATION']), inTransit: count(parcels, ['EXPEDIE', 'EN_TRANSIT']), arrived: count(parcels, ['ARRIVE_DESTINATION', 'DEDOUANEMENT_TRAITEMENT']), availableAtAgency: count(parcels, ['DISPONIBLE_AGENCE', 'PREPARATION_LIVRAISON', 'EN_COURS_LIVRAISON']), delivered: count(parcels, ['LIVRE', 'RETIRE_CLIENT']), anomalies: count(parcels, ['ANOMALIE']) },
     shipments: { total: shipments.length, maritime: shipments.filter((s) => s.transportMode === 'MARITIME').length, aerien: shipments.filter((s) => s.transportMode === 'AERIEN').length, inProgress: count(shipments, ['EN_PREPARATION', 'EXPEDIE', 'EN_TRANSIT']), arrived: count(shipments, ['ARRIVE', 'TRAITE']) },
-    finances: { totalRevenueUSD: revenue, totalExpensesUSD: spend, netBalanceUSD: revenue - spend, clientTotalPaidUSD: sum(clients, 'totalPaidUSD'), clientTotalRemainingUSD: sum(clients, 'remainingBalanceUSD'), totalSalariesPaidUSD: sum(salaries, 'netSalaryUSD'), chinaExpensesUSD: sum(expenses.filter((e) => e.country === 'Chine'), 'amountUSD'), kinshasaExpensesUSD: sum(expenses.filter((e) => e.country === 'RDC'), 'amountUSD'), angolaExpensesUSD: sum(expenses.filter((e) => e.country === 'Angola'), 'amountUSD'), balancesByCurrency: { USD: byCurrency('USD'), CNY: byCurrency('CNY'), CDF: byCurrency('CDF'), AOA: byCurrency('AOA') } },
-    clients: { total: clients.length, active: clients.filter((c) => Number(c.totalParcels) > 0).length, withPendingBalance: clients.filter((c) => Number(c.remainingBalanceUSD) > 0).length },
+    finances: { totalRevenueUSD: revenue, totalExpensesUSD: spend, netBalanceUSD: revenue - spend, clientTotalPaidUSD: clientPaid ?? sum(clients, 'totalPaidUSD'), clientTotalRemainingUSD: clientRemaining ?? sum(clients, 'remainingBalanceUSD'), totalSalariesPaidUSD: sum(salaries, 'netSalaryUSD'), chinaExpensesUSD: sum(expenses.filter((e) => e.country === 'Chine'), 'amountUSD'), kinshasaExpensesUSD: sum(expenses.filter((e) => e.country === 'RDC'), 'amountUSD'), angolaExpensesUSD: sum(expenses.filter((e) => e.country === 'Angola'), 'amountUSD'), balancesByCurrency: { USD: byCurrency('USD'), CNY: byCurrency('CNY'), CDF: byCurrency('CDF'), AOA: byCurrency('AOA') } },
+    clients: actor.role === 'admin'
+      ? { total: clients.length, active: clients.filter((c) => Number(c.totalParcels) > 0).length, withPendingBalance: clients.filter((c) => Number(c.remainingBalanceUSD) > 0).length }
+      : { total: clients.length, active: clients.length, withPendingBalance: new Set(parcels.filter((p) => Number(p.remainingAmountUSD) > 0).map((p) => p.clientId).filter(Boolean)).size },
   };
+}
+
+const phoneDigits = (phone: unknown) => String(phone || '').replace(/\D/g, '');
+// Same subscriber number with or without country code (+243 82… vs 082…).
+function samePhone(a: unknown, b: unknown) {
+  const x = phoneDigits(a), y = phoneDigits(b);
+  return x.length >= 9 && y.length >= 9 && x.slice(-9) === y.slice(-9);
+}
+
+function ownsParcel(actor: Profile, row: { client_id?: string | null; sender_client_id?: string | null }) {
+  return !!actor.client_id && (row.client_id === actor.client_id || row.sender_client_id === actor.client_id);
+}
+
+async function clientTrackingNumbers(actor: Profile): Promise<string[]> {
+  if (!actor.client_id) return [];
+  const { data, error } = await db.from('parcels').select('tracking_number')
+    .or(`client_id.eq.${actor.client_id},sender_client_id.eq.${actor.client_id}`);
+  if (error) throw error;
+  return ((data || []) as Array<{ tracking_number: string }>).map((row) => row.tracking_number);
+}
+
+// --- Client self-service accounts -------------------------------------------
+const ACTIVATION_CODE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const ACTIVATION_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I/L
+
+function generateActivationCode() {
+  const chars: string[] = [];
+  while (chars.length < 8) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(16))) {
+      // Rejection sampling keeps every character equally likely.
+      if (byte < 248 && chars.length < 8) chars.push(ACTIVATION_ALPHABET[byte % 31]);
+    }
+  }
+  return `${chars.slice(0, 4).join('')}-${chars.slice(4).join('')}`;
+}
+const normalizeActivationCode = (code: unknown) => String(code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+async function sha256Hex(value: string) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Links a verified Supabase Auth account to the client file created by an agent.
+// Proof required: verified e-mail + phone on file, and either the e-mail on file
+// or a one-time activation code issued by an agent. Name/phone alone never suffice.
+async function linkClientAccount(request: Request, body: any): Promise<Response> {
+  const token = request.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) return json({ error: 'Session Supabase requise.' }, 401);
+  const { data: auth, error: authError } = await authClient.auth.getUser(token);
+  if (authError || !auth.user) return json({ error: 'Session Supabase invalide ou expirée.' }, 401);
+  const authUser = auth.user;
+  if (!authUser.email || !authUser.email_confirmed_at) {
+    throw new ApiError(403, 'Confirmez d’abord votre adresse e-mail avec le lien reçu, puis reconnectez-vous.');
+  }
+
+  const { data: withinLimit, error: limitError } = await db.rpc('check_public_track_rate_limit', { p_request_key: `client-link:${authUser.id}`, p_limit: 5 });
+  if (limitError) throw limitError;
+  if (!withinLimit) throw new ApiError(429, 'Trop de tentatives. Patientez une minute avant de réessayer.');
+
+  const { data: existing, error: existingError } = await db.from('users').select('*').eq('auth_user_id', authUser.id).maybeSingle();
+  if (existingError) throw existingError;
+  if (existing) throw new ApiError(409, 'Ce compte est déjà associé à un profil. Reconnectez-vous.');
+
+  const noMatch = 'Aucune fiche client ne correspond à ces informations. Demandez un code d’activation à votre agence GZ Mubua Global.';
+  if (phoneDigits(body.phone).length < 9) throw new ApiError(400, 'Saisissez le numéro de téléphone communiqué à votre agence.');
+
+  let clientId: string;
+  let codeId: string | null = null;
+  const code = normalizeActivationCode(body.activationCode);
+  if (code) {
+    const { data: codeRow, error: codeError } = await db.from('client_activation_codes')
+      .select('id,client_id,expires_at,used_at').eq('code_hash', await sha256Hex(code)).maybeSingle();
+    if (codeError) throw codeError;
+    if (!codeRow || codeRow.used_at || new Date(codeRow.expires_at).getTime() <= Date.now()) {
+      throw new ApiError(400, 'Code d’activation invalide ou expiré. Demandez un nouveau code à votre agence.');
+    }
+    clientId = codeRow.client_id;
+    codeId = codeRow.id;
+  } else {
+    const { data: withEmail, error: emailError } = await db.from('clients').select('id,email').not('email', 'is', null);
+    if (emailError) throw emailError;
+    const target = authUser.email.trim().toLowerCase();
+    const matches = ((withEmail || []) as Array<{ id: string; email: string }>).filter((c) => String(c.email || '').trim().toLowerCase() === target);
+    if (matches.length !== 1) throw new ApiError(404, noMatch);
+    clientId = matches[0].id;
+  }
+
+  const { data: client, error: clientError } = await db.from('clients').select('id,full_name,phone,code').eq('id', clientId).maybeSingle();
+  if (clientError) throw clientError;
+  if (!client || !samePhone(client.phone, body.phone)) {
+    throw new ApiError(400, code ? 'Ce numéro de téléphone ne correspond pas à la fiche client liée à ce code.' : noMatch);
+  }
+
+  const userId = id('USR');
+  const actorForAudit = { id: userId, full_name: client.full_name, role: 'client', agency_name: null } as unknown as Profile;
+  const { data: profile, error: linkError } = await db.rpc('link_client_account_transaction', {
+    p_auth_user_id: authUser.id,
+    p_email: authUser.email,
+    p_client_id: client.id,
+    p_code_id: codeId,
+    p_user_id: userId,
+    audit_data: auditRow(actorForAudit, 'CREATE', 'USER', userId,
+      `Compte client créé et associé à la fiche ${client.code} (${client.full_name}) — vérification : e-mail confirmé + téléphone + ${codeId ? 'code d’activation' : 'e-mail enregistré par l’agence'}`),
+  });
+  if (linkError) {
+    const message = String(linkError.message || '');
+    if (message.includes('CLIENT_ALREADY_LINKED')) throw new ApiError(409, 'Cette fiche client est déjà associée à un autre compte. Contactez votre agence.');
+    if (message.includes('AUTH_ALREADY_LINKED')) throw new ApiError(409, 'Ce compte est déjà associé à un profil. Reconnectez-vous.');
+    if (message.includes('CODE_INVALID')) throw new ApiError(400, 'Code d’activation invalide ou expiré. Demandez un nouveau code à votre agence.');
+    throw linkError;
+  }
+  const { auth_user_id: _authUserId, ...safe } = profile as Record<string, unknown>;
+  return json({ profile: fromRow(safe) }, 201);
+}
+
+async function findOrCreateClient(fullName: string, phone: string, destination: unknown, actor: Profile): Promise<string> {
+  const digits = phoneDigits(phone);
+  const { data: candidates, error } = await db.from('clients').select('id,phone');
+  if (error) throw error;
+  const existing = ((candidates || []) as Array<{ id: string; phone: string }>).find((c) => digits && samePhone(c.phone, phone));
+  if (existing) return existing.id;
+  const seq = await nextSequence('client');
+  const angola = destination === 'Angola';
+  const client = { id: id('CLI'), code: `CLI-${String(seq).padStart(3, '0')}`, full_name: fullName, phone, email: '', address: '', city: angola ? 'Luanda' : 'Kinshasa', country: angola ? 'Angola' : 'RDC', total_parcels: 0, total_amount_usd: 0, total_paid_usd: 0, remaining_balance_usd: 0, created_at: today(), notes: 'Créé automatiquement à l’enregistrement d’un colis' };
+  const { error: insertError } = await db.from('clients').insert(client);
+  if (insertError) throw insertError;
+  await audit(actor, 'CREATE', 'CLIENT', client.id, `Création du client ${client.full_name} (enregistrement colis)`);
+  return client.id;
 }
 
 async function createParcel(body: any, actor: Profile) {
@@ -188,13 +366,21 @@ async function createParcel(body: any, actor: Profile) {
   const rates = ratesResponse(await loadRatesRow());
   const transportMode = body.transportMode === 'AERIEN' ? 'AERIEN' : 'MARITIME';
   const currency = rates.freightRateCurrency;
-  const pricePerKg = transportMode === 'AERIEN' ? rates.aerienPricePerKg : rates.maritimePricePerKg;
-  if (body.pricingCurrency !== undefined && (body.pricingCurrency !== currency || Number(body.appliedPricePerKg || 0) !== pricePerKg)) {
-    throw new ApiError(409, 'Le tarif par kg a été modifié entre-temps. Fermez puis rouvrez le formulaire pour appliquer le tarif actuel.');
+  // Air is billed by weight (price per kg), sea by volume (price per CBM).
+  const basis = basisForMode(transportMode);
+  const unitPrice = basis === 'KG' ? rates.aerienPricePerKg : rates.maritimePricePerCbm;
+  const appliedUnitPrice = body.appliedUnitPrice ?? body.appliedPricePerKg;
+  if (body.pricingCurrency !== undefined && (body.pricingCurrency !== currency || Number(appliedUnitPrice || 0) !== unitPrice)) {
+    throw new ApiError(409, 'Le tarif a été modifié entre-temps. Fermez puis rouvrez le formulaire pour appliquer le tarif actuel.');
   }
+  // Volume always comes from the dimensions (cm) when they are given.
+  const volumeCbm = volumeFromDimensionsCm(body.lengthCm, body.widthCm, body.heightCm) ?? (Number(body.volumeCbm) > 0 ? Number(body.volumeCbm) : 0);
+  const weightKg = basis === 'KG' ? Number(body.weightKg) : Number(body.weightKg) > 0 ? Number(body.weightKg) : 0;
   const pricing = computeParcelPricing({
-    weightKg: Number(body.weightKg),
-    pricePerKg,
+    basis,
+    weightKg,
+    volumeCbm,
+    unitPrice,
     manualFreightAmount: Number(body.transportCost ?? 0),
     extraFees: Number(body.extraFees ?? 0),
     amountPaid: Number(body.amountPaid ?? 0),
@@ -205,16 +391,39 @@ async function createParcel(body: any, actor: Profile) {
   const price = pricing.value;
 
   await assertExists('clients', body.clientId || null, 'Client');
-  await assertExists('agencies', body.chinaAgencyId || null, 'Agence Chine');
-  await assertExists('agencies', body.destinationAgencyId || null, 'Agence de destination');
+  // "+ Nouveau client": reuse the client with the same phone, otherwise create the record.
+  if (!body.clientId) body.clientId = await findOrCreateClient(clientName, clientPhone, body.destination, actor);
+  // The China team always registers parcels for its own agency; agency names are
+  // taken from Supabase, never from the browser.
+  const chinaAgencyId = actor.role === 'china_team' ? actor.agency_id : body.chinaAgencyId || null;
+  if (actor.role === 'china_team' && !chinaAgencyId) throw new ApiError(403, 'Aucune agence Chine ne vous est attribuée. Contactez l’administrateur.');
+  const chinaAgency = await loadAgency(chinaAgencyId, 'Agence Chine');
+  const destinationAgency = await loadAgency(body.destinationAgencyId || null, 'Agence de destination');
   await assertExists('shipments', body.shipmentId || null, 'Expédition');
+  // Optional: the parcel's sender is also a registered client (visible in their portal).
+  let senderClientName: string | null = null;
+  if (body.senderClientId) {
+    const { data: sender, error: senderError } = await db.from('clients').select('full_name').eq('id', body.senderClientId).maybeSingle();
+    if (senderError) throw senderError;
+    if (!sender) throw new ApiError(400, `Client expéditeur introuvable (${body.senderClientId}).`);
+    senderClientName = sender.full_name;
+  }
+
+  const now = today();
+  // Reception date chosen in the form: a real calendar day, not in the future
+  // (one day of tolerance for time zones ahead of UTC, e.g. Kinshasa / Guangzhou).
+  const receptionDate = body.chinaReceptionDate ? String(body.chinaReceptionDate) : now;
+  const parsedReception = /^\d{4}-\d{2}-\d{2}$/.test(receptionDate) ? new Date(`${receptionDate}T00:00:00Z`) : null;
+  if (!parsedReception || Number.isNaN(parsedReception.getTime()) || parsedReception.toISOString().slice(0, 10) !== receptionDate) {
+    throw new ApiError(400, 'Date de réception invalide (format attendu : AAAA-MM-JJ).');
+  }
+  if (parsedReception.getTime() > Date.now() + 24 * 60 * 60 * 1000) throw new ApiError(400, 'La date de réception ne peut pas être dans le futur.');
 
   const seq = await nextSequence('parcel');
   const receiptSeq = price.amountPaid > 0 ? await nextSequence('payment') : 0;
-  const now = today();
-  const weight = Number(body.weightKg);
-  const l = Number(body.lengthCm) || 0, w = Number(body.widthCm) || 0, h = Number(body.heightCm) || 0;
-  const volume = l && w && h ? Number(((l * w * h) / 1_000_000).toFixed(3)) : Number(body.volumeCbm) || 0.05;
+  const weight = weightKg;
+  const l = Number(body.lengthCm) > 0 ? Number(body.lengthCm) : 0, w = Number(body.widthCm) > 0 ? Number(body.widthCm) : 0, h = Number(body.heightCm) > 0 ? Number(body.heightCm) : 0;
+  const volume = volumeCbm; // 0 = volume non renseigné (aérien), jamais inventé
   const parcelId = id('PAR'), tracking = `COL-${new Date().getFullYear()}-${String(seq).padStart(6, '0')}`;
   const status = body.status || 'COMMANDE_CREEE';
   const parcel = {
@@ -225,13 +434,16 @@ async function createParcel(body: any, actor: Profile) {
       ? body.photos.filter((url: unknown) => typeof url === 'string' && url.startsWith('https://')).slice(0, MAX_PARCEL_PHOTOS)
       : [],
     supplier: body.supplier || '', purchase_info: body.purchaseInfo || '',
-    china_reception_address: body.chinaReceptionAddress || '', china_reception_date: body.chinaReceptionDate || now,
-    china_agency_id: body.chinaAgencyId || null, china_agency_name: body.chinaAgencyName || '',
+    china_reception_address: body.chinaReceptionAddress || '', china_reception_date: receptionDate,
+    china_agency_id: chinaAgency?.id ?? null, china_agency_name: chinaAgency?.name ?? '',
     shipment_id: body.shipmentId || null, shipment_number: body.shipmentNumber || null,
-    transport_mode: transportMode, origin: body.origin || '', destination: body.destination || '',
-    destination_agency_id: body.destinationAgencyId || null, destination_agency_name: body.destinationAgencyName || '',
+    sender_client_id: body.senderClientId || null, sender_client_name: senderClientName,
+    transport_mode: transportMode, origin: body.origin || '',
+    destination: destinationAgency ? (destinationAgency.country === 'Angola' ? 'Angola' : 'Kinshasa') : body.destination || '',
+    destination_agency_id: destinationAgency?.id ?? null, destination_agency_name: destinationAgency?.name ?? '',
     status, status_history: [{ id: id('SH'), status, date: now, time: nowTime(), user: actor.full_name, agency: actor.agency_name, comment: body.comment || 'Création du colis' }],
-    pricing_currency: price.currency, price_per_kg: price.pricePerKg, pricing_exchange_rate: price.exchangeRate,
+    pricing_currency: price.currency, pricing_unit: price.basis, pricing_exchange_rate: price.exchangeRate,
+    price_per_kg: price.basis === 'KG' ? price.unitPrice : null, price_per_cbm: price.basis === 'CBM' ? price.unitPrice : null,
     freight_amount: price.freightAmount, total_amount: price.totalAmount,
     transport_cost_usd: price.transportCostUSD, extra_fees_usd: price.extraFeesUSD,
     total_cost_usd: price.totalCostUSD, amount_paid_usd: 0, remaining_amount_usd: price.totalCostUSD,
@@ -251,14 +463,24 @@ async function createParcel(body: any, actor: Profile) {
   return fromRow(data);
 }
 
-async function createPayment(body: any, actor: Profile) {
+async function createPayment(body: any, actor: Profile, scoped: any) {
+  if (actor.role === 'cashier' && !actor.agency_id) throw new ApiError(403, 'Aucune agence ne vous est attribuée. Contactez l’administrateur.');
+  if (!(Number(body.originalAmount) > 0)) throw new ApiError(400, 'Le montant encaissé doit être supérieur à 0.');
+  // A receipt is attached to a parcel the cashier can see (RLS: own agency); client comes from the parcel.
+  let parcelRow: { id: string; tracking_number: string; client_id: string | null; client_name: string } | null = null;
+  if (body.parcelId) {
+    const { data, error } = await scoped.from('parcels').select('id,tracking_number,client_id,client_name').eq('id', body.parcelId).maybeSingle();
+    if (error) throw error;
+    if (!data) throw new ApiError(404, 'Colis introuvable ou hors de votre agence.');
+    parcelRow = data;
+  }
   const seq = await nextSequence('payment');
   const { data: ratesRow, error: ratesError } = await db.from('exchange_rates').select('*').limit(1).maybeSingle();
   if (ratesError) throw ratesError;
   const currency = body.currency || 'USD', amount = Number(body.originalAmount) || 0;
   const rates = { CNY: Number(ratesRow?.cny_rate) || 7.25, CDF: Number(ratesRow?.cdf_rate) || 2850, AOA: Number(ratesRow?.aoa_rate) || 920 };
   const { exchangeRate, amountUSD } = ratesToUsd(currency, amount, rates);
-  const payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, parcel_id: body.parcelId || null, parcel_tracking_number: body.parcelTrackingNumber || null, client_id: body.clientId || null, client_name: body.clientName, type: body.type || 'AVANCE', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, payment_method: body.paymentMethod || 'ESPECES', reference: body.reference || '', date: body.date || today(), time: nowTime(), agency_id: actor.agency_id, agency_name: actor.agency_name, cashier_id: actor.id, cashier_name: actor.full_name, notes: body.notes || '' };
+  const payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, parcel_id: parcelRow?.id ?? null, parcel_tracking_number: parcelRow?.tracking_number ?? null, client_id: parcelRow ? parcelRow.client_id : body.clientId || null, client_name: parcelRow?.client_name ?? body.clientName, type: body.type || 'AVANCE', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, payment_method: body.paymentMethod || 'ESPECES', reference: body.reference || '', date: body.date || today(), time: nowTime(), agency_id: actor.agency_id, agency_name: actor.agency_name, cashier_id: actor.id, cashier_name: actor.full_name, notes: body.notes || '' };
   const { data, error } = await db.rpc('record_payment_transaction', {
     payment_data: payment,
     audit_data: auditRow(actor, 'PAYMENT', 'PAYMENT', payment.id, `Encaissement ${payment.receipt_number} de ${amount} ${currency}`),
@@ -293,6 +515,7 @@ async function handle(request: Request): Promise<Response> {
   const body = ['POST', 'PUT', 'PATCH'].includes(method) ? await request.json().catch(() => ({})) : {};
 
   let actor: Profile | null = null;
+  let scoped: any = db; // replaced by the caller's RLS-scoped client once authenticated
   const isPublicTrack = method === 'GET' && parts[0] === 'track' && parts.length === 2;
   if (isPublicTrack) {
     const clientIp = request.headers.get('cf-connecting-ip') || request.headers.get('x-real-ip') || request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
@@ -303,6 +526,16 @@ async function handle(request: Request): Promise<Response> {
     }
     if (!withinLimit) return json({ error: 'Trop de recherches. Réessayez dans une minute.' }, 429);
   }
+  // A freshly signed-up client has a verified Auth account but no profile yet.
+  if (method === 'POST' && parts[0] === 'client-accounts' && parts[1] === 'link') {
+    try {
+      return await linkClientAccount(request, body as any);
+    } catch (error) {
+      if (error instanceof ApiError) return json({ error: error.message }, error.status);
+      console.error('[Edge API client link]', error);
+      return json({ error: describeDbError(error) }, 500);
+    }
+  }
   if (!isPublicTrack) {
     const token = request.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
     if (!token) return json({ error: 'Session Supabase requise.' }, 401);
@@ -311,6 +544,7 @@ async function handle(request: Request): Promise<Response> {
     const { data: profile, error: profileError } = await db.from('users').select('*').eq('auth_user_id', auth.user.id).eq('status', 'active').maybeSingle();
     if (profileError || !profile) return json({ error: 'Aucun profil actif associé à cette session.' }, 403);
     actor = profile as Profile;
+    scoped = scopedClient(token);
     const operation = parts[0] || '';
     let roles = allowed[operation]?.[method];
     if (operation === 'parcels' && parts[2] === 'status' && method === 'POST') roles = ['admin', 'china_team', 'kinshasa_team'];
@@ -324,18 +558,24 @@ async function handle(request: Request): Promise<Response> {
     const route = parts[0];
     const table = route === 'salaries' ? 'salary_payments' : route === 'audit-logs' ? 'audit_logs' : route;
     const resourceId = parts[1];
-    if (actor?.role === 'client' && table === 'parcels' && resourceId && parts[2] !== 'status') {
-      const { data: ownedParcel, error } = await db.from('parcels').select('id').eq('id', resourceId).eq('client_phone', actor!.phone).maybeSingle();
+    // A client account only reaches records of the client file it was linked to
+    // (as recipient or sender), never by phone or name matching.
+    if (actor?.role === 'client' && table === 'parcels' && resourceId) {
+      const { data: ownedParcel, error } = await db.from('parcels').select('client_id,sender_client_id').eq('id', resourceId).maybeSingle();
       if (error) throw error;
-      if (!ownedParcel) return json({ error: 'Colis non trouvé.' }, 404);
+      if (!ownedParcel || !ownsParcel(actor, ownedParcel)) return json({ error: 'Colis non trouvé.' }, 404);
     }
     if (actor?.role === 'client' && table === 'payments' && resourceId) {
-      const { data: ownedPayment, error } = await db.from('payments').select('id,client_id').eq('id', resourceId).maybeSingle();
+      const { data: ownedPayment, error } = await db.from('payments').select('client_id').eq('id', resourceId).maybeSingle();
       if (error) throw error;
-      if (!ownedPayment) return json({ error: 'Paiement non trouvé.' }, 404);
-      const { data: ownedClient, error: clientError } = await db.from('clients').select('id').eq('id', ownedPayment.client_id).eq('phone', actor!.phone).maybeSingle();
-      if (clientError) throw clientError;
-      if (!ownedClient) return json({ error: 'Paiement non trouvé.' }, 404);
+      if (!ownedPayment || !actor.client_id || ownedPayment.client_id !== actor.client_id) return json({ error: 'Paiement non trouvé.' }, 404);
+    }
+    // Any read or change of a specific agency-scoped record requires that RLS lets
+    // this user see it: staff cannot act on another agency's parcels, shipments, payments.
+    if (actor && actor.role !== 'admin' && resourceId && ['parcels', 'shipments', 'payments', 'expenses'].includes(table)) {
+      const { data: visible, error } = await scoped.from(table).select('id').eq('id', resourceId).maybeSingle();
+      if (error) throw error;
+      if (!visible) return json({ error: 'Enregistrement introuvable ou hors de votre agence.' }, 404);
     }
     if (isPublicTrack) {
       const { data, error } = await db.from('parcels').select('tracking_number,transport_mode,destination,destination_agency_name,status,status_history').eq('tracking_number', parts[1].toUpperCase()).maybeSingle();
@@ -368,20 +608,25 @@ async function handle(request: Request): Promise<Response> {
     if (method === 'GET' && route === 'auth' && parts[1] === 'login') return json({ error: 'Utilisez Supabase Auth.' }, 410);
 
     if (route === 'stats' && method === 'GET') {
-      const stats = await calculateStats();
+      const stats = await calculateStats(scoped, actor!);
       if (!['admin', 'cashier'].includes(actor!.role)) delete (stats as any).finances;
       return json(stats);
     }
     if (table === 'notifications' && method === 'GET') {
-      const rows = await list('notifications', 'timestamp');
-      return json(rows.filter((item: any) => item.targetRole === 'ALL' || item.targetRole === actor!.role));
+      const rows = await list('notifications', 'timestamp', scoped);
+      const visible = rows.filter((item: any) => item.targetRole === 'ALL' || item.targetRole === actor!.role);
+      if (actor!.role !== 'client') return json(visible);
+      // Clients only see notifications about their own parcels (others name other clients).
+      const mine = await clientTrackingNumbers(actor!);
+      return json(visible.filter((item: any) => item.parcelTracking && mine.includes(item.parcelTracking)));
     }
     if (table === 'notifications' && method === 'POST' && parts[1] === 'mark-read') {
       const notificationId = (body as any).id;
-      if (notificationId === 'all' && actor!.role !== 'admin') return json({ error: 'Action réservée à l’administrateur.' }, 403);
-      let query = db.from('notifications').update({ is_read: true });
-      if (notificationId === 'all' && actor!.role !== 'admin') query = query.in('target_role', ['ALL', actor!.role]);
-      else query = query.eq('id', notificationId).in('target_role', ['ALL', actor!.role]);
+      if (typeof notificationId !== 'string' || !notificationId) return json({ error: 'Notification requise.' }, 400);
+      // Each role may only mark the notifications it can see.
+      let query = db.from('notifications').update({ is_read: true }).in('target_role', ['ALL', actor!.role]);
+      if (actor!.role === 'client') query = query.in('parcel_tracking', await clientTrackingNumbers(actor!));
+      query = notificationId === 'all' ? query.eq('is_read', false) : query.eq('id', notificationId);
       const { error } = await query;
       if (error) throw error;
       return json({ success: true });
@@ -407,16 +652,17 @@ async function handle(request: Request): Promise<Response> {
         cdf_rate: positive(input.CDF, current.CDF, 'Taux CDF'),
         aoa_rate: positive(input.AOA, current.AOA, 'Taux AOA'),
         maritime_price_per_kg: roundMoney(positive(input.maritimePricePerKg, current.maritimePricePerKg, 'Tarif maritime/kg', true)),
+        maritime_price_per_cbm: roundMoney(positive(input.maritimePricePerCbm, current.maritimePricePerCbm, 'Tarif maritime/CBM', true)),
         aerien_price_per_kg: roundMoney(positive(input.aerienPricePerKg, current.aerienPricePerKg, 'Tarif aérien/kg', true)),
         freight_rate_currency: input.freightRateCurrency ?? current.freightRateCurrency,
         last_updated: today(),
       };
       const { data: saved, error } = await db.from('exchange_rates').upsert(rates).select('*').single();
       if (error) throw error;
-      const tariffChanged = rates.maritime_price_per_kg !== current.maritimePricePerKg || rates.aerien_price_per_kg !== current.aerienPricePerKg || rates.freight_rate_currency !== current.freightRateCurrency;
+      const tariffChanged = rates.maritime_price_per_cbm !== current.maritimePricePerCbm || rates.aerien_price_per_kg !== current.aerienPricePerKg || rates.freight_rate_currency !== current.freightRateCurrency;
       await audit(actor!, 'UPDATE', 'SETTINGS', 'EXCHANGE_RATES',
         tariffChanged
-          ? `Mise à jour des taux et du tarif fret/kg (maritime ${rates.maritime_price_per_kg}, aérien ${rates.aerien_price_per_kg} ${rates.freight_rate_currency})`
+          ? `Mise à jour des taux et des tarifs fret (aérien ${rates.aerien_price_per_kg} ${rates.freight_rate_currency}/kg, maritime ${rates.maritime_price_per_cbm} ${rates.freight_rate_currency}/CBM)`
           : 'Mise à jour des taux de change',
         current, ratesResponse(saved));
       return json(ratesResponse(saved));
@@ -446,13 +692,24 @@ async function handle(request: Request): Promise<Response> {
     if (!tables.has(table)) return json({ error: 'Route introuvable.' }, 404);
     if (['users', 'agencies', 'clients', 'parcels', 'shipments', 'payments', 'expenses', 'employees', 'salary_payments', 'audit_logs', 'notifications'].includes(table) && method === 'GET' && !resourceId) {
       const sort = table === 'agencies' ? 'name' : table === 'employees' ? 'hire_date' : table === 'audit_logs' || table === 'notifications' ? 'timestamp' : table === 'salary_payments' ? 'payment_date' : 'created_at';
-      const records = await list(table, sort);
+      const records = await list(table, sort, scoped);
       let filtered = records;
-      if (actor!.role === 'client' && table === 'parcels') filtered = records.filter((row: any) => String(row.clientPhone || '').replace(/\D/g, '') === String(actor!.phone || '').replace(/\D/g, ''));
+      if (actor!.role === 'client' && table === 'parcels') {
+        filtered = records.filter((row: any) => ownsParcel(actor!, { client_id: row.clientId, sender_client_id: row.senderClientId }));
+      }
       if (actor!.role === 'client' && table === 'payments') {
-        const clients = await list('clients');
-        const ids = new Set(clients.filter((client: any) => String(client.phone || '').replace(/\D/g, '') === String(actor!.phone || '').replace(/\D/g, '')).map((client: any) => client.id));
-        filtered = records.filter((row: any) => ids.has(row.clientId));
+        filtered = actor!.client_id ? records.filter((row: any) => row.clientId === actor!.client_id) : [];
+      }
+      if (table === 'clients') {
+        // Lets agents see which client files already have a self-service account.
+        const { data: linked, error: linkedError } = await db.from('users').select('client_id').not('client_id', 'is', null);
+        if (linkedError) throw linkedError;
+        const withAccount = new Set(((linked || []) as Array<{ client_id: string }>).map((u) => u.client_id));
+        filtered = records.map((row: any) => ({ ...row, hasAccount: withAccount.has(row.id) }));
+        // Operations teams use the shared directory but not the clients' financial balances.
+        if (['china_team', 'kinshasa_team'].includes(actor!.role)) {
+          filtered = filtered.map(({ totalAmountUSD: _a, totalPaidUSD: _p, remainingBalanceUSD: _r, ...rest }: any) => rest);
+        }
       }
       if (table === 'users') filtered = records.map(({ password: _password, authUserId: _authUserId, ...safe }: any) => safe);
       if (table === 'audit_logs') filtered = filtered.slice(0, 200);
@@ -462,7 +719,25 @@ async function handle(request: Request): Promise<Response> {
 
     if (table === 'track') return json({ error: 'Route introuvable.' }, 404);
 
-    if (table === 'clients' && method === 'POST') {
+    if (table === 'clients' && resourceId && parts[2] === 'activation-code' && method === 'POST') {
+      const { data: client, error: clientError } = await db.from('clients').select('id,full_name,code').eq('id', resourceId).maybeSingle();
+      if (clientError) throw clientError;
+      if (!client) return json({ error: 'Client non trouvé.' }, 404);
+      const { data: linkedUser, error: linkedError } = await db.from('users').select('id').eq('client_id', resourceId).maybeSingle();
+      if (linkedError) throw linkedError;
+      if (linkedUser) return json({ error: 'Ce client possède déjà un compte. Aucun nouveau code n’est nécessaire.' }, 409);
+      // Only one valid code at a time: expire the previous unused ones.
+      const nowIso = new Date().toISOString();
+      const { error: expireError } = await db.from('client_activation_codes').update({ expires_at: nowIso }).eq('client_id', resourceId).is('used_at', null);
+      if (expireError) throw expireError;
+      const code = generateActivationCode();
+      const expiresAt = new Date(Date.now() + ACTIVATION_CODE_TTL_MS).toISOString();
+      const { error } = await db.from('client_activation_codes').insert({ id: id('ACT'), client_id: resourceId, code_hash: await sha256Hex(normalizeActivationCode(code)), expires_at: expiresAt, created_by: actor!.id });
+      if (error) throw error;
+      await audit(actor!, 'CREATE', 'CLIENT', resourceId, `Code d’activation de compte émis pour ${client.full_name} (${client.code}), valable 7 jours`);
+      return json({ code, expiresAt }, 201);
+    }
+    if (table === 'clients' && method === 'POST' && !resourceId) {
       const seq = await nextSequence('client');
       const client = { id: id('CLI'), code: `CLI-${String(seq).padStart(3, '0')}`, full_name: (body as any).fullName, phone: (body as any).phone, email: (body as any).email || '', address: (body as any).address || '', city: (body as any).city || 'Kinshasa', country: (body as any).country || 'RDC', total_parcels: 0, total_amount_usd: 0, total_paid_usd: 0, remaining_balance_usd: 0, created_at: today(), notes: (body as any).notes || '' };
       const { error } = await db.from('clients').insert(client);
@@ -470,20 +745,41 @@ async function handle(request: Request): Promise<Response> {
       await audit(actor!, 'CREATE', 'CLIENT', client.id, `Création du client ${client.full_name}`);
       return json(fromRow(client), 201);
     }
-    if (table === 'parcels' && method === 'POST') return json(await createParcel(body, actor!), 201);
-    if (table === 'payments' && method === 'POST') return json(await createPayment(body, actor!), 201);
-    if (table === 'expenses' && method === 'POST') return json(await createExpense(body, actor!), 201);
-    if (table === 'employees' && method === 'POST') {
+    if (table === 'agencies' && method === 'POST' && !resourceId) {
       const input = body as any;
+      const text = (value: unknown) => String(value ?? '').trim();
+      const name = text(input.name), city = text(input.city), country = text(input.country);
+      if (!name || !city) return json({ error: 'Nom et ville de l’agence obligatoires.' }, 400);
+      if (!['Chine', 'RDC', 'Angola'].includes(country)) return json({ error: 'Pays invalide (Chine, RDC ou Angola).' }, 400);
+      const type = ['origin', 'destination', 'hub'].includes(input.type) ? input.type : country === 'Chine' ? 'origin' : 'destination';
+      const seq = await nextSequence('agency');
+      const prefix = country === 'Chine' ? 'CN' : country === 'Angola' ? 'AO' : 'CD';
+      const agency = { id: id('AG'), code: `${prefix}-${String(seq).padStart(3, '0')}`, name, country, city, address: text(input.address), phone: text(input.phone), email: text(input.email), type, manager_name: text(input.managerName) || null };
+      const { error } = await db.from('agencies').insert(agency);
+      if (error) throw error;
+      await audit(actor!, 'CREATE', 'AGENCY', agency.id, `Création de l’agence ${agency.name} (${agency.country})`);
+      return json(fromRow(agency), 201);
+    }
+    if (table === 'parcels' && method === 'POST' && !resourceId) return json(await createParcel(body, actor!), 201);
+    if (table === 'payments' && method === 'POST' && !resourceId) return json(await createPayment(body, actor!, scoped), 201);
+    if (table === 'expenses' && method === 'POST' && !resourceId) return json(await createExpense(body, actor!), 201);
+    if (table === 'employees' && method === 'POST' && !resourceId) {
+      const input = body as any;
+      // No invented values: name, salary and agency must be real.
+      if (!String(input.fullName || '').trim()) return json({ error: 'Nom de l’employé obligatoire.' }, 400);
+      const baseSalary = Number(input.baseSalaryUSD);
+      if (!Number.isFinite(baseSalary) || baseSalary <= 0) return json({ error: 'Salaire de base obligatoire (montant supérieur à 0).' }, 400);
+      const employeeAgency = await loadAgency(input.agencyId || null, 'Agence');
       const seq = await nextSequence('employee');
-      const countryCode = input.country === 'Chine' ? 'GZ' : input.country === 'Angola' ? 'LAD' : 'KIN';
-      const employee = { id: id('EMP'), employee_code: `EMP-${countryCode}-${String(seq).padStart(2, '0')}`, full_name: input.fullName, phone: input.phone, job_title: input.jobTitle, agency_id: input.agencyId || null, agency_name: input.agencyName || actor!.agency_name, country: input.country || 'RDC', base_salary_usd: Number(input.baseSalaryUSD) || 500, preferred_currency: input.preferredCurrency || 'USD', status: 'actif', hire_date: input.hireDate || today() };
+      const country = employeeAgency?.country || input.country || 'RDC';
+      const countryCode = country === 'Chine' ? 'GZ' : country === 'Angola' ? 'LAD' : 'KIN';
+      const employee = { id: id('EMP'), employee_code: `EMP-${countryCode}-${String(seq).padStart(2, '0')}`, full_name: String(input.fullName).trim(), phone: input.phone, job_title: input.jobTitle, agency_id: employeeAgency?.id ?? null, agency_name: employeeAgency?.name ?? null, country, base_salary_usd: baseSalary, preferred_currency: input.preferredCurrency || 'USD', status: 'actif', hire_date: input.hireDate || today() };
       const { error } = await db.from('employees').insert(employee);
       if (error) throw error;
       await audit(actor!, 'CREATE', 'EMPLOYEE', employee.id, `Création employé ${employee.full_name}`);
       return json(fromRow(employee), 201);
     }
-    if (table === 'salary_payments' && method === 'POST') {
+    if (table === 'salary_payments' && method === 'POST' && !resourceId) {
       const input = body as any;
       const seq = await nextSequence('salary');
       const { data: ratesRow, error: ratesError } = await db.from('exchange_rates').select('*').limit(1).maybeSingle();
@@ -504,9 +800,14 @@ async function handle(request: Request): Promise<Response> {
       return json(fromRow(data), 201);
     }
 
-    if (table === 'shipments' && method === 'POST') {
+    if (table === 'shipments' && method === 'POST' && !resourceId) {
+      // The China team only opens shipments departing from its own agency.
+      const departureId = actor!.role === 'china_team' ? actor!.agency_id : (body as any).departureAgencyId || null;
+      if (actor!.role === 'china_team' && !departureId) throw new ApiError(403, 'Aucune agence Chine ne vous est attribuée. Contactez l’administrateur.');
+      const departureAgency = await loadAgency(departureId, 'Agence de départ');
+      const arrivalAgency = await loadAgency((body as any).destinationAgencyId || null, 'Agence de destination');
       const seq = await nextSequence('shipment');
-      const shipment = { id: id('SHIP'), shipment_number: `EXP-${new Date().getFullYear()}-${String(seq).padStart(5, '0')}`, departure_agency_id: (body as any).departureAgencyId || null, departure_agency_name: (body as any).departureAgencyName || '', destination: (body as any).destination || '', destination_agency_id: (body as any).destinationAgencyId || null, destination_agency_name: (body as any).destinationAgencyName || '', transport_mode: (body as any).transportMode || 'MARITIME', carrier_name: (body as any).carrierName || '', container_or_flight_number: (body as any).containerOrFlightNumber || '', departure_date: (body as any).departureDate || null, estimated_arrival_date: (body as any).estimatedArrivalDate || null, actual_arrival_date: null, parcel_count: 0, total_weight_kg: 0, total_volume_cbm: 0, total_cost_usd: Number((body as any).totalCostUSD) || 0, status: 'EN_PREPARATION', parcel_ids: [], comments: (body as any).comments || '', created_at: today(), updated_at: today() };
+      const shipment = { id: id('SHIP'), shipment_number: `EXP-${new Date().getFullYear()}-${String(seq).padStart(5, '0')}`, departure_agency_id: departureAgency?.id ?? null, departure_agency_name: departureAgency?.name ?? '', destination: (body as any).destination || '', destination_agency_id: arrivalAgency?.id ?? null, destination_agency_name: arrivalAgency?.name ?? '', transport_mode: (body as any).transportMode || 'MARITIME', carrier_name: (body as any).carrierName || '', container_or_flight_number: (body as any).containerOrFlightNumber || '', departure_date: (body as any).departureDate || null, estimated_arrival_date: (body as any).estimatedArrivalDate || null, actual_arrival_date: null, parcel_count: 0, total_weight_kg: 0, total_volume_cbm: 0, total_cost_usd: Number((body as any).totalCostUSD) || 0, status: 'EN_PREPARATION', parcel_ids: [], comments: (body as any).comments || '', created_at: today(), updated_at: today() };
       const { error } = await db.from('shipments').insert(shipment);
       if (error) throw error;
       await audit(actor!, 'CREATE', 'SHIPMENT', shipment.id, `Création de l’expédition ${shipment.shipment_number}`);
@@ -586,6 +887,11 @@ async function handle(request: Request): Promise<Response> {
     if (table === 'shipments' && resourceId && parts[2] === 'parcels' && method === 'POST') {
       const parcelIds = (body as any).parcelIds;
       if (!Array.isArray(parcelIds) || parcelIds.some((value) => typeof value !== 'string')) return json({ error: 'Liste parcelIds invalide.' }, 400);
+      if (actor!.role !== 'admin' && parcelIds.length > 0) {
+        const { data: visibleParcels, error: visibleError } = await scoped.from('parcels').select('id').in('id', parcelIds);
+        if (visibleError) throw visibleError;
+        if ((visibleParcels || []).length !== new Set(parcelIds).size) return json({ error: 'Certains colis sont introuvables ou hors de votre agence.' }, 403);
+      }
       const { data, error } = await db.rpc('link_parcels_to_shipment_transaction', {
         target_shipment_id: resourceId, target_parcel_ids: parcelIds, actor_name: actor!.full_name,
         audit_data: auditRow(actor!, 'UPDATE', 'SHIPMENT', resourceId, `Ajout de ${parcelIds.length} colis à l’expédition.`),
@@ -594,13 +900,14 @@ async function handle(request: Request): Promise<Response> {
       return json(fromRow(data));
     }
 
-    if (table === 'users' && method === 'POST') {
+    if (table === 'users' && method === 'POST' && !resourceId) {
       const input = body as any;
       if (!input.email || !input.fullName || !input.username || !input.role) return json({ error: 'Nom, identifiant, rôle et e-mail requis.' }, 400);
-      if (!['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'].includes(input.role)) return json({ error: 'Rôle utilisateur invalide.' }, 400);
+      // Validate role + agency before sending the invitation e-mail.
+      const agency = await resolveStaffAgency(input.role, input.agencyId);
       const { data: invited, error: inviteError } = await db.auth.admin.inviteUserByEmail(input.email, { data: { full_name: input.fullName } });
       if (inviteError) throw inviteError;
-      const user = { id: id('USR'), username: input.username, full_name: input.fullName, email: input.email, phone: input.phone || '', role: input.role, agency_id: input.agencyId || null, agency_name: input.agencyName || actor!.agency_name, status: 'active', created_at: new Date().toISOString(), auth_user_id: invited.user.id };
+      const user = { id: id('USR'), username: input.username, full_name: input.fullName, email: input.email, phone: input.phone || '', role: input.role, agency_id: agency?.id ?? null, agency_name: agency?.name ?? null, status: 'active', created_at: new Date().toISOString(), auth_user_id: invited.user.id };
       const { error } = await db.from('users').insert(user);
       if (error) { await db.auth.admin.deleteUser(invited.user.id); throw error; }
       await audit(actor!, 'CREATE', 'USER', user.id, `Invitation de ${user.full_name} (${user.role})`);
@@ -611,10 +918,22 @@ async function handle(request: Request): Promise<Response> {
     if (table === 'users' && method === 'PUT' && resourceId) {
       const input = body as any;
       const patch: Record<string, unknown> = {};
-      for (const [source, target] of [['username','username'],['fullName','full_name'],['email','email'],['phone','phone'],['role','role'],['agencyId','agency_id'],['agencyName','agency_name'],['status','status']]) {
+      for (const [source, target] of [['username','username'],['fullName','full_name'],['email','email'],['phone','phone'],['status','status']]) {
         if (input[source] !== undefined) patch[target] = input[source];
       }
-      if (patch.role && !['admin','china_team','kinshasa_team','cashier','client'].includes(String(patch.role))) return json({ error: 'Rôle utilisateur invalide.' }, 400);
+      if (input.status !== undefined && !['active', 'inactive'].includes(String(input.status))) return json({ error: 'Statut invalide.' }, 400);
+      if (input.role !== undefined || input.agencyId !== undefined) {
+        const { data: current, error: currentError } = await db.from('users').select('role,agency_id,client_id').eq('id', resourceId).maybeSingle();
+        if (currentError) throw currentError;
+        if (!current) return json({ error: 'Utilisateur non trouvé.' }, 404);
+        if (current.role === 'client') return json({ error: 'Le rôle et l’agence d’un compte client ne se modifient pas : il reste lié à sa fiche client.' }, 400);
+        if (resourceId === actor!.id && input.role !== undefined && input.role !== 'admin') return json({ error: 'Vous ne pouvez pas retirer votre propre rôle administrateur.' }, 400);
+        const role = input.role ?? current.role;
+        const agency = await resolveStaffAgency(role, input.agencyId !== undefined ? input.agencyId : current.agency_id);
+        patch.role = role;
+        patch.agency_id = agency?.id ?? null;
+        patch.agency_name = agency?.name ?? null;
+      }
       const { data, error } = await db.from('users').update(patch).eq('id', resourceId).select('*').maybeSingle();
       if (error) throw error;
       if (!data) return json({ error: 'Utilisateur non trouvé.' }, 404);
@@ -624,14 +943,14 @@ async function handle(request: Request): Promise<Response> {
     }
 
     if (method === 'GET' && resourceId && table !== 'supabase') {
-      const { data, error } = await db.from(table).select('*').eq('id', resourceId).maybeSingle();
+      const { data, error } = await scoped.from(table).select('*').eq('id', resourceId).maybeSingle();
       if (error) throw error;
       if (!data) return json({ error: 'Enregistrement non trouvé.' }, 404);
-      if (actor!.role === 'client' && table === 'parcels' && String(data.client_phone || '').replace(/\D/g, '') !== String(actor!.phone || '').replace(/\D/g, '')) return json({ error: 'Colis non trouvé.' }, 404);
-      if (actor!.role === 'client' && table === 'payments') {
-        const { data: client, error: clientError } = await db.from('clients').select('phone').eq('id', data.client_id).maybeSingle();
-        if (clientError) throw clientError;
-        if (!client || String(client.phone || '').replace(/\D/g, '') !== String(actor!.phone || '').replace(/\D/g, '')) return json({ error: 'Paiement non trouvé.' }, 404);
+      if (actor!.role === 'client' && table === 'parcels' && !ownsParcel(actor!, data)) return json({ error: 'Colis non trouvé.' }, 404);
+      if (actor!.role === 'client' && table === 'payments' && (!actor!.client_id || data.client_id !== actor!.client_id)) return json({ error: 'Paiement non trouvé.' }, 404);
+      if (table === 'clients' && ['china_team', 'kinshasa_team'].includes(actor!.role)) {
+        const { total_amount_usd: _a, total_paid_usd: _p, remaining_balance_usd: _r, ...rest } = data;
+        return json(fromRow(rest));
       }
       if (table === 'users') {
         const { password: _password, auth_user_id: _authUserId, ...safe } = data;
@@ -647,20 +966,32 @@ async function handle(request: Request): Promise<Response> {
       delete patch.password;
       if (table === 'parcels') {
         // Totals, payments and the tariff snapshot are derived server-side only.
-        for (const key of ['total_cost_usd', 'amount_paid_usd', 'remaining_amount_usd', 'price_per_kg', 'pricing_exchange_rate', 'pricing_currency', 'freight_amount', 'total_amount']) delete patch[key];
-        if (patch.weight_kg !== undefined || patch.transport_cost_usd !== undefined || patch.extra_fees_usd !== undefined) {
+        // The transport mode fixes the pricing basis (kg / CBM) and is frozen too.
+        for (const key of ['total_cost_usd', 'amount_paid_usd', 'remaining_amount_usd', 'price_per_kg', 'price_per_cbm', 'pricing_unit', 'pricing_exchange_rate', 'pricing_currency', 'freight_amount', 'total_amount', 'transport_mode']) delete patch[key];
+        const measureKeys = ['weight_kg', 'length_cm', 'width_cm', 'height_cm', 'volume_cbm', 'transport_cost_usd', 'extra_fees_usd'];
+        if (measureKeys.some((key) => patch[key] !== undefined)) {
           const { data: existing, error: existingError } = await db.from('parcels').select('*').eq('id', resourceId).maybeSingle();
           if (existingError) throw existingError;
           if (!existing) return json({ error: 'Colis non trouvé.' }, 404);
-          const weight = Number(patch.weight_kg ?? existing.weight_kg);
+          // Parcels priced before CBM pricing have no pricing_unit: kg if a kg tariff was frozen.
+          const unit = existing.pricing_unit || (Number(existing.price_per_kg) > 0 ? 'KG' : null);
+          const weight = Number(patch.weight_kg ?? existing.weight_kg ?? 0);
           const extraUSD = Number(patch.extra_fees_usd ?? existing.extra_fees_usd ?? 0);
-          if (!Number.isFinite(weight) || weight <= 0) throw new ApiError(400, 'Le poids doit être un nombre supérieur à 0 kg.');
+          const dims = [patch.length_cm ?? existing.length_cm, patch.width_cm ?? existing.width_cm, patch.height_cm ?? existing.height_cm];
+          for (const dim of dims) if (dim !== null && dim !== undefined && (!Number.isFinite(Number(dim)) || Number(dim) < 0)) throw new ApiError(400, 'Les dimensions doivent être des nombres positifs (cm).');
+          const dimsChanged = ['length_cm', 'width_cm', 'height_cm'].some((key) => patch[key] !== undefined);
+          const dimsVolume = volumeFromDimensionsCm(dims[0], dims[1], dims[2]);
+          if (dimsChanged && dimsVolume === null) throw new ApiError(400, 'Longueur, largeur et hauteur doivent toutes être supérieures à 0 (cm).');
+          const volume = dimsVolume ?? Number(patch.volume_cbm ?? existing.volume_cbm ?? 0);
+          if (!Number.isFinite(weight) || weight < 0 || (unit !== 'CBM' && weight <= 0)) throw new ApiError(400, 'Le poids doit être un nombre supérieur à 0 kg.');
+          if (unit === 'CBM' && !(volume > 0)) throw new ApiError(400, 'Saisissez la longueur, la largeur et la hauteur (en cm, supérieures à 0) pour calculer le volume.');
           if (!Number.isFinite(extraUSD) || extraUSD < 0) throw new ApiError(400, 'Les frais annexes ne peuvent pas être négatifs.');
-          const snapshotRate = Number(existing.price_per_kg) || 0;
-          if (snapshotRate > 0) {
-            // Re-price with the tariff frozen on this parcel, never the current universal tariff.
+          patch.volume_cbm = volume;
+          const frozenRate = unit === 'CBM' ? Number(existing.price_per_cbm) || 0 : unit === 'KG' ? Number(existing.price_per_kg) || 0 : 0;
+          if (frozenRate > 0) {
+            // Re-price with the tariff frozen on this parcel (kg or CBM), never the current tariff.
             const fx = Number(existing.pricing_exchange_rate) || 1;
-            const freight = roundMoney(weight * snapshotRate);
+            const freight = roundMoney((unit === 'CBM' ? volume : weight) * frozenRate);
             patch.freight_amount = freight;
             patch.transport_cost_usd = roundMoney(freight / fx);
             patch.total_amount = roundMoney(freight + extraUSD * fx);
@@ -779,4 +1110,9 @@ async function handle(request: Request): Promise<Response> {
   }
 }
 
-Deno.serve(handle);
+Deno.serve(async (request) => {
+  const response = await handle(request);
+  response.headers.set('Access-Control-Allow-Origin', allowOrigin(request.headers.get('Origin')));
+  response.headers.append('Vary', 'Origin');
+  return response;
+});

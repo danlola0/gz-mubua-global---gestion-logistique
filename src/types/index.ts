@@ -5,7 +5,8 @@ export type Currency = 'USD' | 'CNY' | 'CDF' | 'AOA';
 export type TransportMode = 'MARITIME' | 'AERIEN';
 
 export interface FreightRates {
-  maritimePricePerKg: number;
+  maritimePricePerKg: number; // historique : le maritime est désormais facturé au CBM
+  maritimePricePerCbm: number; // Prix maritime par CBM (m³)
   aerienPricePerKg: number;
   freightRateCurrency: Currency;
 }
@@ -200,6 +201,7 @@ export interface User {
   status: 'active' | 'inactive';
   createdAt: string;
   avatar?: string;
+  clientId?: string; // Fiche client liée (rôle client uniquement)
 }
 
 export interface Agency {
@@ -230,6 +232,7 @@ export interface Client {
   remainingBalanceUSD: number;
   createdAt: string;
   notes?: string;
+  hasAccount?: boolean; // Le client a créé son compte en ligne
 }
 
 export interface Parcel {
@@ -238,6 +241,8 @@ export interface Parcel {
   clientId: string;
   clientName: string;
   clientPhone: string;
+  senderClientId?: string; // Expéditeur, s'il est aussi un client enregistré
+  senderClientName?: string;
   description: string;
   quantity: number;
   weightKg: number;
@@ -262,7 +267,9 @@ export interface Parcel {
   status: ParcelStatus;
   statusHistory: StatusHistoryItem[];
   pricingCurrency: Currency;
+  pricingUnit?: 'KG' | 'CBM'; // Base de calcul figée : KG (aérien) ou CBM (maritime)
   pricePerKg?: number; // Tarif/kg figé à l'enregistrement, en pricingCurrency
+  pricePerCbm?: number; // Tarif/CBM figé à l'enregistrement, en pricingCurrency
   pricingExchangeRate?: number; // Unités de pricingCurrency pour 1 USD à l'enregistrement
   freightAmount?: number; // Poids × tarif, en pricingCurrency
   totalAmount?: number; // Fret + frais annexes, en pricingCurrency
@@ -434,8 +441,9 @@ export interface AuditLogItem {
   entityType: 'PARCEL' | 'SHIPMENT' | 'PAYMENT' | 'EXPENSE' | 'CLIENT' | 'EMPLOYEE' | 'USER' | 'SETTINGS';
   entityId: string;
   details: string;
-  oldValue?: string;
-  newValue?: string;
+  // JSON : texte (ex. statut) ou objet complet (paramètres, données supprimées)
+  oldValue?: unknown;
+  newValue?: unknown;
 }
 
 export interface NotificationItem {

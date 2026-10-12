@@ -12,7 +12,7 @@ import {
   ExternalLink,
   Phone,
 } from 'lucide-react';
-import type { Parcel, Payment, User } from '../types/index.ts';
+import type { Agency, Parcel, Payment, User } from '../types/index.ts';
 import { PARCEL_STATUSES } from '../types/index.ts';
 import { formatUSD } from '../services/api.ts';
 
@@ -20,6 +20,7 @@ interface ClientPortalViewProps {
   currentUser: User;
   parcels: Parcel[];
   payments: Payment[];
+  agencies: Agency[];
   onSelectParcel: (parcel: Parcel) => void;
   onOpenPublicTracking: () => void;
 }
@@ -28,18 +29,20 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
   currentUser,
   parcels,
   payments,
+  agencies,
   onSelectParcel,
   onOpenPublicTracking,
 }) => {
   const [search, setSearch] = useState('');
 
-  // Client only sees their own parcels (matching phone or client name)
-  const myParcels = parcels.filter(
-    (p) =>
-      p.clientPhone.replace(/\s+/g, '') === currentUser.phone.replace(/\s+/g, '') ||
-      p.clientName.toLowerCase() === currentUser.fullName.toLowerCase() ||
-      p.clientId === currentUser.id
-  );
+  // Parcels of the verified client file this account is linked to (the API already
+  // returns only these; never match on name or phone).
+  const myClientId = currentUser.clientId;
+  const myParcels = myClientId
+    ? parcels.filter((p) => p.clientId === myClientId || p.senderClientId === myClientId)
+    : [];
+  // Support contacts come from the agencies recorded in Supabase.
+  const supportAgencies = agencies.filter((a) => a.phone);
 
   const filtered = myParcels.filter((p) => {
     const q = search.toLowerCase();
@@ -50,8 +53,10 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
     );
   });
 
-  const totalDueUSD = myParcels.reduce((s, p) => s + (p.totalCostUSD || 0), 0);
-  const totalPaidUSD = myParcels.reduce((s, p) => s + (p.amountPaidUSD || 0), 0);
+  // Amounts are owed by the recipient, so totals only cover parcels addressed to the client.
+  const billedParcels = myParcels.filter((p) => p.clientId === myClientId);
+  const totalDueUSD = billedParcels.reduce((s, p) => s + (p.totalCostUSD || 0), 0);
+  const totalPaidUSD = billedParcels.reduce((s, p) => s + (p.amountPaidUSD || 0), 0);
   const remainingUSD = Math.max(0, totalDueUSD - totalPaidUSD);
 
   return (
@@ -84,7 +89,7 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
           <span className="text-[11px] font-semibold uppercase text-slate-500">Total Fret Facturé</span>
           <div className="text-xl font-black text-slate-900 mt-1">{formatUSD(totalDueUSD)}</div>
-          <span className="text-[10px] text-slate-400">Pour {myParcels.length} colis</span>
+          <span className="text-[10px] text-slate-400">Pour {billedParcels.length} colis reçus</span>
         </div>
 
         <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
@@ -128,7 +133,9 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
 
         {filtered.length === 0 ? (
           <div className="bg-white p-12 text-center text-slate-400 text-xs rounded-2xl border">
-            Aucun colis trouvé sous votre nom ou numéro.
+            {myClientId
+              ? 'Aucun colis associé à votre fiche client pour le moment.'
+              : 'Votre compte n’est pas encore associé à une fiche client. Contactez votre agence.'}
           </div>
         ) : (
           filtered.map((parcel) => {
@@ -157,6 +164,16 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
                       )}
                       {parcel.transportMode}
                     </span>
+                    {parcel.clientId === myClientId && (
+                      <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+                        Destinataire
+                      </span>
+                    )}
+                    {parcel.senderClientId === myClientId && (
+                      <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200">
+                        Expéditeur
+                      </span>
+                    )}
                   </div>
 
                   <p className="font-semibold text-slate-800 text-xs">{parcel.description}</p>
@@ -202,23 +219,25 @@ export const ClientPortalView: React.FC<ClientPortalViewProps> = ({
         )}
       </div>
 
-      {/* Customer support help */}
-      <div className="bg-amber-50 p-4 rounded-xl border border-amber-200 text-xs text-amber-900 flex items-center justify-between">
-        <div>
+      {/* Customer support help: real agency contacts from Supabase */}
+      {supportAgencies.length > 0 && (
+        <div className="bg-amber-50 p-4 rounded-xl border border-amber-200 text-xs text-amber-900 space-y-2">
           <strong className="block text-sm font-bold">Besoin d'aide ou d'informations sur votre colis ?</strong>
-          <span>
-            Contactez notre service client Kinshasa (+243 81 555 0101) ou Guangzhou (+86 138 0013 8000).
-          </span>
+          <div className="flex flex-wrap gap-2">
+            {supportAgencies.map((agency) => (
+              <a
+                key={agency.id}
+                href={`https://wa.me/${agency.phone.replace(/\D/g, '')}`}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 text-white font-bold"
+              >
+                <Phone className="w-3.5 h-3.5" /> {agency.name} : {agency.phone}
+              </a>
+            ))}
+          </div>
         </div>
-        <a
-          href="https://wa.me/243815550101"
-          target="_blank"
-          rel="noreferrer"
-          className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white font-bold text-xs"
-        >
-          WhatsApp Support
-        </a>
-      </div>
+      )}
     </div>
   );
 };

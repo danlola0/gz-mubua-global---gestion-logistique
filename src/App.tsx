@@ -20,7 +20,7 @@ import type {
   DashboardStats,
   ParcelStatus,
 } from './types/index.ts';
-import { api } from './services/api.ts';
+import { api, createWhatsAppTrackingLink } from './services/api.ts';
 import { Header } from './components/Header.tsx';
 import { Sidebar, type NavTab } from './components/Sidebar.tsx';
 import { DashboardView } from './views/DashboardView.tsx';
@@ -69,6 +69,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
     AOA: 920,
     lastUpdated: '2026-10-07',
     maritimePricePerKg: 0,
+    maritimePricePerCbm: 0,
     aerienPricePerKg: 0,
     freightRateCurrency: 'USD',
   });
@@ -89,9 +90,14 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
   const [selectedPaymentForReceipt, setSelectedPaymentForReceipt] = useState<Payment | null>(null);
   const [showNewParcelModal, setShowNewParcelModal] = useState(false);
   const [parcelSavedMessage, setParcelSavedMessage] = useState<string | null>(null);
+  // Last registered parcel: lets the agent send its tracking number to the client right away.
+  const [savedParcel, setSavedParcel] = useState<Parcel | null>(null);
   const [showNewShipmentModal, setShowNewShipmentModal] = useState(false);
-  const [showPublicTracking, setShowPublicTracking] = useState(false);
-  const [publicTrackingSearchInitial, setPublicTrackingSearchInitial] = useState('');
+  const [showPublicTracking, setShowPublicTracking] = useState(() => new URLSearchParams(window.location.search).has('suivi'));
+  // A shared link ?suivi=COL-... opens the tracking with that number, even when signed in.
+  const [publicTrackingSearchInitial, setPublicTrackingSearchInitial] = useState(
+    () => new URLSearchParams(window.location.search).get('suivi')?.trim() || ''
+  );
 
   // Initial load from backend
   const loadData = async () => {
@@ -186,7 +192,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
     setParcels((prev) => prev.map((p) => (p.id === id ? updated : p)));
     setSelectedParcelForDetail(updated);
     // Reload stats and logs
-    loadData();
+    await loadData();
   };
 
   const handleCreateParcel = async (data: any) => {
@@ -196,7 +202,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
     }
     setParcels((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
     setParcelSavedMessage(`Colis ${created.trackingNumber} enregistré dans Supabase.`);
-    setTimeout(() => setParcelSavedMessage(null), 5000);
+    setSavedParcel(created);
     // Refresh list, client balances and stats from Supabase.
     await loadData();
   };
@@ -221,7 +227,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
       userId: currentUser.id,
       userRole: currentUser.role,
     });
-    loadData();
+    await loadData();
   };
 
   const handleConfirmArrivalKinshasa = async (shipmentId: string) => {
@@ -232,7 +238,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
       userRole: currentUser.role,
       agencyName: currentUser.agencyName,
     });
-    loadData();
+    await loadData();
   };
 
   const handleMarkParcelReady = async (parcelId: string, location: string) => {
@@ -262,27 +268,27 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
 
   const handleCreatePayment = async (data: any) => {
     await api.createPayment(data);
-    loadData();
+    await loadData();
   };
 
   const handleCreateExpense = async (data: any) => {
     await api.createExpense(data);
-    loadData();
+    await loadData();
   };
 
   const handleCreateSalaryPayment = async (data: any) => {
     await api.createSalaryPayment(data);
-    loadData();
+    await loadData();
   };
 
   const handleCreateEmployee = async (data: any) => {
     await api.createEmployee(data);
-    loadData();
+    await loadData();
   };
 
   const handleCreateClient = async (data: any) => {
     await api.createClient(data);
-    loadData();
+    await loadData();
   };
 
   const handleDeleteParcel = async (id: string, withPayments = false) => {
@@ -356,16 +362,26 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
   const handleUpdateRates = async (ratesData: Partial<ExchangeRates>) => {
     const updated = await api.updateExchangeRates(ratesData);
     setExchangeRates(updated);
-    loadData();
+    await loadData();
+  };
+
+  const handleCreateAgency = async (agencyData: Partial<Agency>) => {
+    await api.createAgency(agencyData);
+    await loadData();
   };
 
   const handleCreateUser = async (userData: Partial<User>) => {
     await api.createUser(userData);
-    loadData();
+    await loadData();
   };
 
   const handleMarkNotificationRead = async (id: string | 'all') => {
-    await api.markNotificationRead(id);
+    try {
+      await api.markNotificationRead(id);
+    } catch (err) {
+      console.error('[Notifications] Marquage impossible:', err);
+      return;
+    }
     if (id === 'all') {
       setNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
     } else {
@@ -576,6 +592,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               userName={currentUser.fullName}
               userId={currentUser.id}
               onCreateClient={handleCreateClient}
+              onCreateActivationCode={(clientId) => api.createClientActivationCode(clientId)}
               onSelectParcel={(p) => setSelectedParcelForDetail(p)}
               onOpenPaymentForParcel={(p) => {
                 setCurrentTab('cashier');
@@ -588,6 +605,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               currentUser={currentUser}
               parcels={parcels}
               payments={payments}
+              agencies={agencies}
               onSelectParcel={(p) => setSelectedParcelForDetail(p)}
               onOpenPublicTracking={() => setShowPublicTracking(true)}
             />
@@ -602,6 +620,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               users={users}
               onUpdateRates={handleUpdateRates}
               onCreateUser={handleCreateUser}
+              onCreateAgency={handleCreateAgency}
             />
           )}
         </main>
@@ -628,12 +647,35 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
       )}
 
       {parcelSavedMessage && (
-        <p
+        <div
           role="status"
-          className="fixed bottom-4 right-4 z-50 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700 shadow-lg"
+          className="fixed bottom-4 right-4 left-4 sm:left-auto z-50 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700 shadow-lg space-y-2 sm:max-w-sm"
         >
-          {parcelSavedMessage}
-        </p>
+          <div className="flex items-start justify-between gap-2">
+            <span>{parcelSavedMessage}</span>
+            <button
+              type="button"
+              onClick={() => {
+                setParcelSavedMessage(null);
+                setSavedParcel(null);
+              }}
+              className="text-emerald-700 hover:text-emerald-900"
+              aria-label="Fermer"
+            >
+              ✕
+            </button>
+          </div>
+          {savedParcel && savedParcel.clientPhone && (
+            <a
+              href={createWhatsAppTrackingLink(savedParcel)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block text-center rounded-lg bg-emerald-600 hover:bg-emerald-500 px-3 py-1.5 font-bold text-white"
+            >
+              Envoyer le numéro {savedParcel.trackingNumber} au client (WhatsApp)
+            </a>
+          )}
+        </div>
       )}
 
       {showNewParcelModal && (
@@ -646,12 +688,17 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
           userName={currentUser.fullName}
           userId={currentUser.id}
           userRole={currentUser.role}
+          userAgencyId={currentUser.agencyId}
         />
       )}
 
       {showNewShipmentModal && (
         <NewShipmentModal
-          agencies={agencies}
+          agencies={
+            currentUser.role === 'china_team'
+              ? agencies.filter((a) => a.id === currentUser.agencyId || a.type === 'destination' || a.country !== 'Chine')
+              : agencies
+          }
           onClose={() => setShowNewShipmentModal(false)}
           onCreateShipment={handleCreateShipment}
         />

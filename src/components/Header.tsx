@@ -151,7 +151,7 @@ export const Header: React.FC<HeaderProps> = ({
                   <div className="font-semibold text-sm text-white flex items-center gap-2">
                     <Bell className="w-4 h-4 text-amber-400" /> Notifications internes
                   </div>
-                  {unreadNotifs.length > 0 && currentUser.role === 'admin' && (
+                  {unreadNotifs.length > 0 && (
                     <button
                       onClick={() => onMarkNotificationRead('all')}
                       className="text-xs text-amber-400 hover:underline"

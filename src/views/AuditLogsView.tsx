@@ -7,6 +7,7 @@ import {
   ShieldCheck,
   Calendar,
   Layers,
+  RotateCcw,
   ArrowRight,
 } from 'lucide-react';
 import type { AuditLogItem } from '../types/index.ts';
@@ -14,6 +15,112 @@ import type { AuditLogItem } from '../types/index.ts';
 interface AuditLogsViewProps {
   logs: AuditLogItem[];
 }
+
+const ACTION_LABELS: Record<string, string> = {
+  CREATE: 'Création',
+  UPDATE: 'Modification',
+  DELETE: 'Suppression',
+  STATUS_CHANGE: 'Changement de statut',
+  PAYMENT: 'Encaissement',
+  EXPENSE: 'Décaissement',
+  PERMISSION_CHANGE: 'Droits',
+  LOGIN: 'Connexion',
+};
+
+const ENTITY_LABELS: Record<string, string> = {
+  PARCEL: 'Colis',
+  SHIPMENT: 'Expédition',
+  PAYMENT: 'Paiement',
+  EXPENSE: 'Dépense',
+  CLIENT: 'Client',
+  EMPLOYEE: 'Employé',
+  USER: 'Utilisateur',
+  AGENCY: 'Agence',
+  SETTINGS: 'Paramètres',
+  SALARY: 'Salaire',
+};
+
+const FIELD_LABELS: Record<string, string> = {
+  CNY: 'Taux CNY',
+  CDF: 'Taux CDF',
+  AOA: 'Taux AOA',
+  maritimePricePerKg: 'Tarif maritime/kg',
+  aerienPricePerKg: 'Tarif aérien/kg',
+  freightRateCurrency: 'Devise du tarif',
+};
+
+// old/new values are stored as JSON: plain text for status changes, full objects
+// for settings updates and deletions. Never render an object directly (React crash).
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const asText = (value: unknown): string => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return JSON.stringify(value);
+};
+
+function changedFields(oldValue: unknown, newValue: unknown) {
+  if (!isPlainObject(oldValue) || !isPlainObject(newValue)) return null;
+  const keys = Array.from(new Set([...Object.keys(oldValue), ...Object.keys(newValue)]));
+  return keys
+    .filter((key) => key !== 'lastUpdated' && asText(oldValue[key]) !== asText(newValue[key]))
+    .map((key) => ({ key, before: asText(oldValue[key]), after: asText(newValue[key]) }));
+}
+
+const formatTimestamp = (value: string) => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'medium' });
+};
+
+const LogValues: React.FC<{ log: AuditLogItem }> = ({ log }) => {
+  const oldValue: unknown = log.oldValue;
+  const newValue: unknown = log.newValue;
+  if (oldValue == null && newValue == null) return null;
+
+  const fields = changedFields(oldValue, newValue);
+  if (fields) {
+    if (fields.length === 0) return null;
+    return (
+      <ul className="text-[10px] text-slate-700 mt-0.5 space-y-0.5 font-mono">
+        {fields.map((field) => (
+          <li key={field.key} className="flex flex-wrap items-center gap-1">
+            <span className="font-semibold">{FIELD_LABELS[field.key] || field.key} :</span>
+            <span className="line-through">{field.before || '—'}</span>
+            <ArrowRight className="w-3 h-3 text-amber-500" />
+            <span className="text-emerald-700 font-bold">{field.after || '—'}</span>
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
+  if (!isPlainObject(oldValue) && !isPlainObject(newValue) && !Array.isArray(oldValue) && !Array.isArray(newValue)) {
+    return (
+      <div className="text-[10px] text-slate-700 mt-0.5 flex flex-wrap items-center gap-1 font-mono">
+        {oldValue != null && <span className="line-through">{asText(oldValue)}</span>}
+        {oldValue != null && newValue != null && <ArrowRight className="w-3 h-3 text-amber-500" />}
+        {newValue != null && <span className="text-emerald-700 font-bold">{asText(newValue)}</span>}
+      </div>
+    );
+  }
+
+  // A full record (e.g. data kept from a deletion): show it on demand.
+  const snapshot = oldValue ?? newValue;
+  return (
+    <details className="mt-1 text-[10px] text-slate-700">
+      <summary className="cursor-pointer font-semibold text-amber-700">
+        {log.action === 'DELETE' ? 'Voir les données supprimées (conservées)' : 'Voir les données enregistrées'}
+      </summary>
+      <pre className="mt-1 max-h-64 max-w-xl overflow-auto whitespace-pre-wrap break-all rounded-lg bg-slate-50 border border-slate-200 p-2 font-mono">
+        {JSON.stringify(snapshot, null, 2)}
+      </pre>
+    </details>
+  );
+};
 
 export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
   const [search, setSearch] = useState('');
@@ -24,9 +131,9 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
     const q = search.toLowerCase();
     const matchSearch =
       !search ||
-      log.userName.toLowerCase().includes(q) ||
-      log.details.toLowerCase().includes(q) ||
-      log.entityId.toLowerCase().includes(q);
+      (log.userName || '').toLowerCase().includes(q) ||
+      (log.details || '').toLowerCase().includes(q) ||
+      (log.entityId || '').toLowerCase().includes(q);
 
     const matchAction = actionFilter === 'ALL' || log.action === actionFilter;
     const matchEntity = entityFilter === 'ALL' || log.entityType === entityFilter;
@@ -88,7 +195,7 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
           />
         </div>
 
-        <div className="flex items-center gap-2 self-start sm:self-auto">
+        <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
           <select
             value={actionFilter}
             onChange={(e) => setActionFilter(e.target.value)}
@@ -100,7 +207,7 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
             <option value="PAYMENT">Encaissement</option>
             <option value="EXPENSE">Décaissement</option>
             <option value="UPDATE">Modification</option>
-            <option value="LOGIN">Connexion</option>
+            <option value="DELETE">Suppression</option>
           </select>
 
           <select
@@ -115,7 +222,24 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
             <option value="EXPENSE">Dépense</option>
             <option value="CLIENT">Client</option>
             <option value="USER">Utilisateur</option>
+            <option value="AGENCY">Agence</option>
+            <option value="EMPLOYEE">Employé</option>
+            <option value="SETTINGS">Paramètres</option>
           </select>
+
+          <button
+            type="button"
+            onClick={() => {
+              setSearch('');
+              setActionFilter('ALL');
+              setEntityFilter('ALL');
+            }}
+            disabled={!search && actionFilter === 'ALL' && entityFilter === 'ALL'}
+            className="flex items-center gap-1 px-2 py-1.5 text-[11px] font-semibold text-rose-600 bg-rose-50 hover:bg-rose-100 rounded-lg transition whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Effacer la recherche et les filtres"
+          >
+            <RotateCcw className="w-3 h-3" /> Réinitialiser
+          </button>
         </div>
       </div>
 
@@ -133,13 +257,20 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
+              {filteredLogs.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="py-12 text-center text-slate-400">
+                    {logs.length === 0 ? 'Aucun événement enregistré pour le moment.' : 'Aucun événement ne correspond à ces filtres.'}
+                  </td>
+                </tr>
+              )}
               {filteredLogs.map((log) => (
-                <tr key={log.id} className="hover:bg-slate-50 transition">
+                <tr key={log.id} className="hover:bg-slate-50 transition align-top">
                   <td className="py-3 px-4 font-mono whitespace-nowrap text-slate-700">
-                    {log.timestamp}
+                    {formatTimestamp(log.timestamp)}
                   </td>
                   <td className="py-3 px-4 whitespace-nowrap">
-                    <div className="font-bold text-slate-900">{log.userName}</div>
+                    <div className="font-bold text-slate-900">{log.userName || 'Système'}</div>
                     <div className="text-[10px] text-slate-700">
                       {log.userRole} {log.agencyName ? `• ${log.agencyName}` : ''}
                     </div>
@@ -150,22 +281,16 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
                         log.action
                       )}`}
                     >
-                      {log.action}
+                      {ACTION_LABELS[log.action] || log.action}
                     </span>
                   </td>
                   <td className="py-3 px-4">
-                    <div className="font-bold text-slate-800">{log.entityType}</div>
+                    <div className="font-bold text-slate-800">{ENTITY_LABELS[log.entityType] || log.entityType}</div>
                     <div className="text-[10px] font-mono text-slate-700">{log.entityId}</div>
                   </td>
                   <td className="py-3 px-4">
                     <div className="text-slate-800 font-medium">{log.details}</div>
-                    {log.oldValue && log.newValue && (
-                      <div className="text-[10px] text-slate-700 mt-0.5 flex items-center gap-1 font-mono">
-                        <span className="line-through">{log.oldValue}</span>
-                        <ArrowRight className="w-3 h-3 text-amber-500" />
-                        <span className="text-emerald-700 font-bold">{log.newValue}</span>
-                      </div>
-                    )}
+                    <LogValues log={log} />
                   </td>
                 </tr>
               ))}

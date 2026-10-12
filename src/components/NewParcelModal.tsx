@@ -18,7 +18,7 @@ import {
 import type { Client, TransportMode, Currency, Agency, ExchangeRates } from '../types/index.ts';
 import { api, formatCurrency } from '../services/api.ts';
 import { compressImageFile } from '../services/imageUpload.ts';
-import { computeParcelPricing, currencyRate } from '../../supabase/functions/_shared/parcelPricing.ts';
+import { basisForMode, computeParcelPricing, currencyRate, volumeFromDimensionsCm } from '../../supabase/functions/_shared/parcelPricing.ts';
 
 interface NewParcelModalProps {
   clients: Client[];
@@ -29,6 +29,7 @@ interface NewParcelModalProps {
   userName: string;
   userId: string;
   userRole: string;
+  userAgencyId?: string;
 }
 
 export const NewParcelModal: React.FC<NewParcelModalProps> = ({
@@ -40,25 +41,35 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
   userName,
   userId,
   userRole,
+  userAgencyId,
 }) => {
   const [clientId, setClientId] = useState(clients[0]?.id || 'NEW');
   const [clientName, setClientName] = useState(clients[0]?.fullName || '');
   const [clientPhone, setClientPhone] = useState(clients[0]?.phone || '');
+  // Optional: the sender is also a registered client (sees the parcel in their portal).
+  const [senderClientId, setSenderClientId] = useState('');
   const [description, setDescription] = useState('');
+  // Reception date of the parcel (defaults to today, local time; can be set to a past day).
+  const todayLocal = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
+  const [receptionDate, setReceptionDate] = useState(todayLocal);
   const [quantity, setQuantity] = useState(1);
   const [weightKg, setWeightKg] = useState<number | ''>('');
   const [lengthCm, setLengthCm] = useState<number | ''>('');
   const [widthCm, setWidthCm] = useState<number | ''>('');
   const [heightCm, setHeightCm] = useState<number | ''>('');
-  const [volumeCbm, setVolumeCbm] = useState<number | ''>('');
   const [transportMode, setTransportMode] = useState<TransportMode>('MARITIME');
-  const [destination, setDestination] = useState('Kinshasa');
+  // Real destination agencies (RDC / Angola) recorded in Supabase.
+  const destinationAgencies = agencies.filter((a) => a.country === 'RDC' || a.country === 'Angola');
+  const [destinationAgencyId, setDestinationAgencyId] = useState(destinationAgencies[0]?.id || '');
+  const destinationAgency = agencies.find((a) => a.id === destinationAgencyId);
   // Only real agencies can be referenced (parcels.china_agency_id is a foreign key).
   const chinaAgencies = agencies.filter((a) => a.country === 'Chine' || a.type !== 'destination');
-  const [chinaAgencyId, setChinaAgencyId] = useState(chinaAgencies[0]?.id || '');
-  const [chinaReceptionAddress, setChinaReceptionAddress] = useState(
-    'Entrepôt GZ MUBUA Hub Guangzhou, Quai 03'
+  // The China team always registers for its own agency (enforced again by the API).
+  const [chinaAgencyId, setChinaAgencyId] = useState(
+    userRole === 'china_team' && userAgencyId ? userAgencyId : chinaAgencies[0]?.id || ''
   );
+  // Reception address = the selected China agency's real address (no invented default).
+  const chinaReceptionAddress = agencies.find((a) => a.id === chinaAgencyId)?.address || '';
   const [supplier, setSupplier] = useState('');
   const [purchaseInfo, setPurchaseInfo] = useState('');
   // Amounts below are expressed in the tariff currency (pricingCurrency).
@@ -75,36 +86,30 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  // Universal per-kg tariff configured by the admin; 0 means manual pricing.
+  // Air is billed by weight (price per kg), sea by volume (price per CBM);
+  // tariffs come from the admin settings. 0 means manual pricing.
   const pricingCurrency: Currency = exchangeRates.freightRateCurrency || 'USD';
-  const pricePerKg =
-    (transportMode === 'AERIEN' ? exchangeRates.aerienPricePerKg : exchangeRates.maritimePricePerKg) || 0;
-  const hasTariff = pricePerKg > 0;
+  const basis = basisForMode(transportMode);
+  const unitPrice = (basis === 'KG' ? exchangeRates.aerienPricePerKg : exchangeRates.maritimePricePerCbm) || 0;
+  const hasTariff = unitPrice > 0;
+  const volumeCbm = volumeFromDimensionsCm(lengthCm, widthCm, heightCm);
+  const hasMeasure = basis === 'KG' ? weightKg !== '' : lengthCm !== '' || widthCm !== '' || heightCm !== '';
   const pricing = useMemo(
     () =>
       computeParcelPricing({
-        weightKg: Number(weightKg),
-        pricePerKg,
+        basis,
+        weightKg: basis === 'KG' ? Number(weightKg) : 0,
+        volumeCbm: volumeCbm ?? 0,
+        unitPrice,
         manualFreightAmount: Number(transportCost) || 0,
         extraFees: Number(extraFees) || 0,
         amountPaid: Number(amountPaid) || 0,
         currency: pricingCurrency,
         exchangeRate: currencyRate(pricingCurrency, exchangeRates),
       }),
-    [weightKg, pricePerKg, transportCost, extraFees, amountPaid, pricingCurrency, exchangeRates]
+    [basis, weightKg, volumeCbm, unitPrice, transportCost, extraFees, amountPaid, pricingCurrency, exchangeRates]
   );
   const money = (amount: number) => formatCurrency(amount, pricingCurrency);
-
-  // Auto calculate volume in CBM whenever L, W, H change
-  useEffect(() => {
-    const l = Number(lengthCm);
-    const w = Number(widthCm);
-    const h = Number(heightCm);
-    if (l > 0 && w > 0 && h > 0) {
-      const cbm = (l * w * h) / 1000000;
-      setVolumeCbm(Number(cbm.toFixed(3)));
-    }
-  }, [lengthCm, widthCm, heightCm]);
 
   // When client changes from dropdown
   const handleClientSelect = (id: string) => {
@@ -155,8 +160,12 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError(null);
-    if (!clientName.trim() || !clientPhone.trim() || !description.trim() || !weightKg) {
-      setSubmitError('Veuillez remplir le nom du client, le téléphone, la description et le poids.');
+    if (!clientName.trim() || !clientPhone.trim() || !description.trim()) {
+      setSubmitError('Veuillez remplir le nom du client, le téléphone et la description.');
+      return;
+    }
+    if (!receptionDate || receptionDate > todayLocal) {
+      setSubmitError('Indiquez une date de réception valide (pas dans le futur).');
       return;
     }
     if (!pricing.ok) {
@@ -171,26 +180,29 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
         clientId: clientId === 'NEW' ? null : clientId,
         clientName,
         clientPhone,
+        senderClientId: senderClientId || null,
         description,
+        chinaReceptionDate: receptionDate,
         quantity: Number(quantity) || 1,
-        weightKg: Number(weightKg),
-        lengthCm: lengthCm ? Number(lengthCm) : undefined,
-        widthCm: widthCm ? Number(widthCm) : undefined,
-        heightCm: heightCm ? Number(heightCm) : undefined,
-        volumeCbm: volumeCbm ? Number(volumeCbm) : 0.05,
+        // Air: weight only. Sea: dimensions (cm) -> volume (CBM), weight not required.
+        weightKg: basis === 'KG' ? Number(weightKg) : 0,
+        lengthCm: basis === 'CBM' ? Number(lengthCm) : undefined,
+        widthCm: basis === 'CBM' ? Number(widthCm) : undefined,
+        heightCm: basis === 'CBM' ? Number(heightCm) : undefined,
+        volumeCbm: basis === 'CBM' ? volumeCbm ?? undefined : undefined,
         photos,
-        supplier: supplier || 'Fournisseur Chine',
+        supplier: supplier.trim(),
         purchaseInfo,
         chinaReceptionAddress,
         chinaAgencyId: chinaAgencyId || null,
         chinaAgencyName: chinaAgency?.name || '',
         transportMode,
-        destination,
-        destinationAgencyName:
-          destination === 'Angola' ? 'Agence Luanda Viana' : 'Dépôt & Retrait Kinshasa Limete',
+        // Destination = a real agency; the API derives the agency name and city.
+        destination: destinationAgency ? (destinationAgency.country === 'Angola' ? 'Angola' : 'Kinshasa') : '',
+        destinationAgencyId: destinationAgencyId || null,
         // The server recomputes the price; these let it detect a tariff change meanwhile.
         pricingCurrency,
-        appliedPricePerKg: pricePerKg,
+        appliedUnitPrice: unitPrice,
         transportCost: hasTariff ? 0 : Number(transportCost) || 0,
         extraFees: Number(extraFees) || 0,
         amountPaid: Number(amountPaid) || 0,
@@ -291,109 +303,193 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
                 />
               </div>
             </div>
+            {clients.length > 0 && (
+              <div className="mt-3">
+                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                  Expéditeur (si c’est aussi un client enregistré)
+                </label>
+                <select
+                  value={senderClientId}
+                  onChange={(e) => setSenderClientId(e.target.value)}
+                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                >
+                  <option value="">— Aucun (fournisseur / expéditeur externe) —</option>
+                  {clients.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.fullName} ({c.phone})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
-          {/* 2. Merchandise details */}
+          {/* 2. Transport mode + merchandise details */}
           <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
             <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700 mb-3 flex items-center gap-1.5">
-              <Box className="w-4 h-4 text-amber-500" /> Détails Marchandise & Poids
+              <Box className="w-4 h-4 text-amber-500" /> Mode de transport & Marchandise
             </h4>
+            <div className="grid grid-cols-2 gap-2 mb-3">
+              <button
+                type="button"
+                onClick={() => setTransportMode('AERIEN')}
+                aria-pressed={transportMode === 'AERIEN'}
+                className={`py-2.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 border transition ${
+                  transportMode === 'AERIEN'
+                    ? 'bg-sky-600 text-white border-sky-700 shadow-sm'
+                    : 'bg-white text-slate-700 border-slate-300'
+                }`}
+              >
+                <Plane className="w-4 h-4" /> Transport aérien
+                <span className="font-normal opacity-80">(au kg)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setTransportMode('MARITIME')}
+                aria-pressed={transportMode === 'MARITIME'}
+                className={`py-2.5 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 border transition ${
+                  transportMode === 'MARITIME'
+                    ? 'bg-blue-600 text-white border-blue-700 shadow-sm'
+                    : 'bg-white text-slate-700 border-slate-300'
+                }`}
+              >
+                <Ship className="w-4 h-4" /> Transport maritime
+                <span className="font-normal opacity-80">(au CBM)</span>
+              </button>
+            </div>
             <div className="space-y-3">
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                  Description détaillée des articles *
-                </label>
-                <input
-                  type="text"
-                  required
-                  placeholder="Ex: Rouleaux de tissus wax synthétique, 12 ballots"
-                  value={description}
-                  onChange={(e) => setDescription(e.target.value)}
-                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Nom / description des articles *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ex: Rouleaux de tissus wax synthétique, 12 ballots"
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Date de réception du colis *
+                  </label>
+                  <input
+                    type="date"
+                    required
+                    max={todayLocal}
+                    value={receptionDate}
+                    onChange={(e) => setReceptionDate(e.target.value)}
+                    className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                    Quantité de colis
-                  </label>
-                  <input
-                    type="number"
-                    min="1"
-                    value={quantity}
-                    onChange={(e) => setQuantity(Number(e.target.value))}
-                    className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                    Poids réel (kg) *
-                  </label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="0.01"
-                    required
-                    placeholder="Ex: 85"
-                    value={weightKg}
-                    onChange={(e) => setWeightKg(e.target.value === '' ? '' : Number(e.target.value))}
-                    className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                    Dimensions (L x l x h cm)
-                  </label>
-                  <div className="grid grid-cols-3 gap-1">
+              {transportMode === 'AERIEN' ? (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Quantité de colis
+                    </label>
                     <input
                       type="number"
-                      placeholder="L"
-                      value={lengthCm}
-                      onChange={(e) =>
-                        setLengthCm(e.target.value === '' ? '' : Number(e.target.value))
-                      }
-                      className="text-xs p-2 rounded-lg border border-slate-300 bg-white text-center"
+                      min="1"
+                      value={quantity}
+                      onChange={(e) => setQuantity(Number(e.target.value))}
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
                     />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Poids du colis (kg) *
+                    </label>
                     <input
                       type="number"
-                      placeholder="l"
-                      value={widthCm}
-                      onChange={(e) =>
-                        setWidthCm(e.target.value === '' ? '' : Number(e.target.value))
-                      }
-                      className="text-xs p-2 rounded-lg border border-slate-300 bg-white text-center"
-                    />
-                    <input
-                      type="number"
-                      placeholder="h"
-                      value={heightCm}
-                      onChange={(e) =>
-                        setHeightCm(e.target.value === '' ? '' : Number(e.target.value))
-                      }
-                      className="text-xs p-2 rounded-lg border border-slate-300 bg-white text-center"
+                      step="0.01"
+                      min="0.01"
+                      required
+                      placeholder="Ex: 4,02"
+                      value={weightKg}
+                      onChange={(e) => setWeightKg(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
                     />
                   </div>
                 </div>
-
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                    Volume cubique (m³ CBM)
-                  </label>
-                  <input
-                    type="number"
-                    step="0.001"
-                    placeholder="Ex: 0.54"
-                    value={volumeCbm}
-                    onChange={(e) =>
-                      setVolumeCbm(e.target.value === '' ? '' : Number(e.target.value))
-                    }
-                    className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-amber-50 font-mono font-bold"
-                  />
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Quantité de colis
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      value={quantity}
+                      onChange={(e) => setQuantity(Number(e.target.value))}
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Longueur (cm) *
+                    </label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0.1"
+                      required
+                      placeholder="Ex: 100"
+                      value={lengthCm}
+                      onChange={(e) => setLengthCm(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Largeur (cm) *
+                    </label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0.1"
+                      required
+                      placeholder="Ex: 80"
+                      value={widthCm}
+                      onChange={(e) => setWidthCm(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Hauteur (cm) *
+                    </label>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min="0.1"
+                      required
+                      placeholder="Ex: 50"
+                      value={heightCm}
+                      onChange={(e) => setHeightCm(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                    />
+                  </div>
+                  <div className="col-span-2 sm:col-span-1">
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Volume (CBM = m³)
+                    </label>
+                    <input
+                      type="text"
+                      readOnly
+                      value={volumeCbm !== null ? volumeCbm.toLocaleString('fr-FR', { minimumFractionDigits: 3, maximumFractionDigits: 3 }) : '—'}
+                      title="Longueur × Largeur × Hauteur (cm) ÷ 1 000 000"
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-amber-50 font-mono font-bold"
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
             </div>
           </div>
 
@@ -402,48 +498,23 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
             <h4 className="text-xs font-bold uppercase tracking-wider text-slate-700 mb-3 flex items-center gap-1.5">
               <Ship className="w-4 h-4 text-amber-500" /> Expédition, Acheminement & Réception Chine
             </h4>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                  Mode de Transport Fret
-                </label>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setTransportMode('MARITIME')}
-                    className={`py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 border transition ${
-                      transportMode === 'MARITIME'
-                        ? 'bg-blue-600 text-white border-blue-700 shadow-sm'
-                        : 'bg-white text-slate-700 border-slate-300'
-                    }`}
-                  >
-                    <Ship className="w-3.5 h-3.5" /> Maritime
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setTransportMode('AERIEN')}
-                    className={`py-2 px-3 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 border transition ${
-                      transportMode === 'AERIEN'
-                        ? 'bg-sky-600 text-white border-sky-700 shadow-sm'
-                        : 'bg-white text-slate-700 border-slate-300'
-                    }`}
-                  >
-                    <Plane className="w-3.5 h-3.5" /> Aérien
-                  </button>
-                </div>
-              </div>
-
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="block text-[11px] font-semibold text-slate-700 mb-1">
                   Destination Finale
                 </label>
                 <select
-                  value={destination}
-                  onChange={(e) => setDestination(e.target.value)}
+                  value={destinationAgencyId}
+                  required
+                  onChange={(e) => setDestinationAgencyId(e.target.value)}
                   className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
                 >
-                  <option value="Kinshasa">Kinshasa (RDC) - Principal</option>
-                  <option value="Angola">Angola (Luanda) - Secondaire</option>
+                  {destinationAgencies.length === 0 && <option value="">Aucune agence de destination configurée</option>}
+                  {destinationAgencies.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name} ({a.city}, {a.country})
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -454,7 +525,9 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
                 <select
                   value={chinaAgencyId}
                   onChange={(e) => setChinaAgencyId(e.target.value)}
-                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                  disabled={userRole === 'china_team'}
+                  title={userRole === 'china_team' ? 'Votre agence attribuée' : undefined}
+                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white disabled:bg-slate-100"
                 >
                   {chinaAgencies.length === 0 && <option value="">Aucune agence Chine configurée</option>}
                   {chinaAgencies.map((a) => (
@@ -509,7 +582,7 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
                     type="text"
                     readOnly
                     value={pricing.ok ? money(pricing.value.freightAmount) : '—'}
-                    title={`${Number(weightKg) || 0} kg × ${money(pricePerKg)}/kg`}
+                    title={basis === 'KG' ? `${Number(weightKg) || 0} kg × ${money(unitPrice)}/kg` : `${volumeCbm ?? 0} m³ × ${money(unitPrice)}/CBM`}
                     className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-slate-100 font-bold"
                   />
                 ) : (
@@ -527,8 +600,10 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
                 )}
                 <p className="text-[10px] text-slate-500 mt-1">
                   {hasTariff
-                    ? `Tarif ${transportMode === 'AERIEN' ? 'aérien' : 'maritime'} : ${money(pricePerKg)}/kg`
-                    : 'Aucun tarif/kg configuré : saisie manuelle.'}
+                    ? basis === 'KG'
+                      ? `Aérien : ${Number(weightKg) || 0} kg × ${money(unitPrice)}/kg`
+                      : `Maritime : ${(volumeCbm ?? 0).toLocaleString('fr-FR', { maximumFractionDigits: 3 })} m³ × ${money(unitPrice)}/CBM`
+                    : `Aucun tarif ${basis === 'KG' ? 'aérien/kg' : 'maritime/CBM'} configuré : saisie manuelle.`}
                 </p>
               </div>
 
@@ -588,7 +663,11 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
                 </>
               ) : (
                 <p className="sm:col-span-2 text-rose-700 font-semibold">
-                  {weightKg === '' ? 'Saisissez le poids pour calculer le montant.' : pricing.error}
+                  {!hasMeasure
+                    ? basis === 'KG'
+                      ? 'Saisissez le poids pour calculer le montant.'
+                      : 'Saisissez la longueur, la largeur et la hauteur pour calculer le volume et le montant.'
+                    : pricing.error}
                 </p>
               )}
             </div>
@@ -685,7 +764,7 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
             </button>
             <button
               type="submit"
-              disabled={isSubmitting || uploadingCount > 0 || (weightKg !== '' && !pricing.ok)}
+              disabled={isSubmitting || uploadingCount > 0 || (hasMeasure && !pricing.ok)}
               className="px-5 py-2 text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition shadow-md shadow-amber-500/20 disabled:opacity-50"
             >
               {isSubmitting
