@@ -20,8 +20,8 @@ export const SplashScreen: React.FC<SplashScreenProps> = ({
     </div>
 
     <section className="w-full max-w-md text-center">
-      <div className="mx-auto mb-8 flex h-20 w-20 items-center justify-center rounded-[1.7rem] border border-amber-300/30 bg-gradient-to-br from-amber-300 via-amber-500 to-orange-600 shadow-[0_0_60px_rgba(245,158,11,0.24)]">
-        <span className="text-3xl font-black tracking-[-0.08em] text-[#101827]">GZ</span>
+      <div className="mx-auto mb-8 w-fit rounded-[1.7rem] border border-amber-300/30 bg-white px-5 py-3 shadow-[0_0_60px_rgba(245,158,11,0.24)]">
+        <img src="/logo.png" alt="GZ Mubua Global" className="h-28 w-auto object-contain" />
       </div>
 
       <p className="mb-3 flex items-center justify-center gap-2 text-[10px] font-bold uppercase tracking-[0.32em] text-amber-300">

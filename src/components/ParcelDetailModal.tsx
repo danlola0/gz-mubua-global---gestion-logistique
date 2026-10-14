@@ -49,6 +49,8 @@ interface ParcelDetailModalProps {
   onOpenPaymentForParcel: (parcel: Parcel) => void;
   onDeleteParcel?: (id: string, withPayments?: boolean) => Promise<void>;
   onUpdateParcel?: (id: string, data: Partial<Parcel>) => Promise<void>;
+  /** Opens the modal directly on the edit form or the delete confirmation (row buttons). */
+  initialAction?: 'edit' | 'delete';
 }
 
 export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
@@ -63,6 +65,7 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
   onOpenPaymentForParcel,
   onDeleteParcel,
   onUpdateParcel,
+  initialAction,
 }) => {
   if (!parcel) return null;
 
@@ -78,7 +81,7 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
   const [activeTab, setActiveTab] = useState<'timeline' | 'details' | 'photos'>('timeline');
 
   // Deletion state
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(initialAction === 'delete' && !!onDeleteParcel);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   // Parcels with cash receipts can only be deleted with an explicit opt-in.
@@ -86,10 +89,11 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
   const [deleteWithPayments, setDeleteWithPayments] = useState(false);
 
   // Editing state
-  const [isEditing, setIsEditing] = useState(false);
+  const [isEditing, setIsEditing] = useState(initialAction === 'edit' && !!onUpdateParcel);
   const [editDesc, setEditDesc] = useState(parcel.description);
   const [editWeight, setEditWeight] = useState(parcel.weightKg);
   const [editSupplier, setEditSupplier] = useState(parcel.supplier || '');
+  const [editTransitDays, setEditTransitDays] = useState<number | ''>(parcel.estimatedTransitDays ?? '');
   const [editCost, setEditCost] = useState(parcel.transportCostUSD || 0);
   const [editLength, setEditLength] = useState<number | ''>(parcel.lengthCm ?? '');
   const [editWidth, setEditWidth] = useState<number | ''>(parcel.widthCm ?? '');
@@ -148,6 +152,7 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
           ? { lengthCm: Number(editLength), widthCm: Number(editWidth), heightCm: Number(editHeight) }
           : { weightKg: Number(editWeight) }),
         supplier: editSupplier,
+        estimatedTransitDays: editTransitDays === '' ? null : Number(editTransitDays),
         // With a frozen tariff the server recomputes the freight (weight or volume).
         ...(editComputedCostUSD === null ? { transportCostUSD: Number(editCost) || 0 } : {}),
       });
@@ -583,6 +588,18 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
                       <span className="text-slate-400">Mode de transport :</span>
                       <span className="font-semibold text-slate-800">{parcel.transportMode}</span>
                     </div>
+                    {parcel.estimatedTransitDays !== null && parcel.estimatedTransitDays !== undefined && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Délai d’acheminement :</span>
+                        <span className="font-semibold text-slate-800">{parcel.estimatedTransitDays} j</span>
+                      </div>
+                    )}
+                    {parcel.estimatedArrivalDate && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Arrivée estimée :</span>
+                        <span className="font-bold text-emerald-700">{formatDay(parcel.estimatedArrivalDate)}</span>
+                      </div>
+                    )}
                     {parcel.shipmentNumber && (
                       <div className="flex justify-between pt-2 border-t border-slate-200">
                         <span className="text-slate-400">N° d'Expédition Fret :</span>
@@ -897,6 +914,20 @@ export const ParcelDetailModal: React.FC<ParcelDetailModalProps> = ({
                   onChange={(e) => setEditSupplier(e.target.value)}
                   className="w-full p-2 border rounded-xl"
                 />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Délai d’acheminement (jours)</label>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  max="365"
+                  value={editTransitDays}
+                  onChange={(e) => setEditTransitDays(e.target.value === '' ? '' : Number(e.target.value))}
+                  className="w-full p-2 border rounded-xl"
+                />
+                <p className="text-[10px] text-slate-500 mt-0.5">L’arrivée estimée est recalculée (date de réception + délai).</p>
               </div>
             </div>
 

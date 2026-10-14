@@ -1,14 +1,16 @@
 import React from 'react';
 import { X, Printer, DollarSign, CheckCircle2 } from 'lucide-react';
-import type { Payment } from '../types/index.ts';
+import type { Payment, PaymentMethodConfig } from '../types/index.ts';
 import { formatUSD, formatCurrency } from '../services/api.ts';
 
 interface PaymentReceiptModalProps {
   payment: Payment | null;
   onClose: () => void;
+  paymentMethods?: PaymentMethodConfig[];
 }
 
-export const PaymentReceiptModal: React.FC<PaymentReceiptModalProps> = ({ payment, onClose }) => {
+export const PaymentReceiptModal: React.FC<PaymentReceiptModalProps> = ({ payment, onClose, paymentMethods = [] }) => {
+  const methodName = paymentMethods.find((m) => m.code === payment?.paymentMethod)?.label || payment?.paymentMethod;
   if (!payment) return null;
 
   const handlePrint = () => {
@@ -45,6 +47,7 @@ export const PaymentReceiptModal: React.FC<PaymentReceiptModalProps> = ({ paymen
           <div className="w-full bg-white p-6 border-2 border-slate-300 rounded-xl shadow font-sans text-slate-900 space-y-4">
             {/* Header */}
             <div className="text-center border-b pb-3 border-slate-200">
+              <img src="/logo.png" alt="GZ Mubua Global" className="mx-auto mb-2 h-20 w-auto object-contain" />
               <h2 className="text-xl font-black text-slate-950">GZ MUBUA GLOBAL</h2>
               <p className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">
                 TRANSIT • FRET INTERNATIONAL • CHINE - KINSHASA - ANGOLA
@@ -89,7 +92,7 @@ export const PaymentReceiptModal: React.FC<PaymentReceiptModalProps> = ({ paymen
               </div>
               <div className="flex justify-between">
                 <span className="text-slate-500">Mode de règlement :</span>
-                <span className="font-semibold text-slate-800">{payment.paymentMethod}</span>
+                <span className="font-semibold text-slate-800">{methodName}</span>
               </div>
               {payment.reference && (
                 <div className="flex justify-between">

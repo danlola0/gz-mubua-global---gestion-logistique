@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import type { Client, Parcel, Payment, UserRole } from '../types/index.ts';
 import { formatUSD, PUBLIC_APP_URL } from '../services/api.ts';
+import { ConfirmDeleteModal, EditRecordModal, RowActions } from '../components/RecordTools.tsx';
 
 interface ClientsViewProps {
   clients: Client[];
@@ -23,6 +24,8 @@ interface ClientsViewProps {
   userId: string;
   onCreateClient: (data: any) => Promise<void>;
   onCreateActivationCode?: (clientId: string) => Promise<{ code: string; expiresAt: string }>;
+  onUpdateClient?: (id: string, data: Partial<Client>) => Promise<void>;
+  onDeleteClient?: (id: string, withRecords?: boolean) => Promise<void>;
   onSelectParcel: (parcel: Parcel) => void;
   onOpenPaymentForParcel: (parcel: Parcel) => void;
 }
@@ -36,11 +39,25 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
   userId,
   onCreateClient,
   onCreateActivationCode,
+  onUpdateClient,
+  onDeleteClient,
   onSelectParcel,
   onOpenPaymentForParcel,
 }) => {
   const [search, setSearch] = useState('');
   const [selectedClient, setSelectedClient] = useState<Client | null>(null);
+  // Client files are edited / deleted by the admin (also enforced by the API).
+  const isAdmin = userRole === 'admin';
+  const [editingClient, setEditingClient] = useState<Client | null>(null);
+  const [deletingClient, setDeletingClient] = useState<Client | null>(null);
+  // What a client deletion would also remove (shown in the confirmation).
+  const deletingRecords = (() => {
+    if (!deletingClient) return { parcels: 0, payments: 0, paidUSD: 0 };
+    const ownParcels = parcels.filter((p) => p.clientId === deletingClient.id);
+    const parcelIds = new Set(ownParcels.map((p) => p.id));
+    const ownPayments = payments.filter((p) => p.clientId === deletingClient.id || (p.parcelId && parcelIds.has(p.parcelId)));
+    return { parcels: ownParcels.length, payments: ownPayments.length, paidUSD: ownPayments.reduce((t, p) => t + (Number(p.amountUSD) || 0), 0) };
+  })();
   // One-time code the agent hands to the client so they can create their account.
   const [activation, setActivation] = useState<{ clientId: string; code: string; expiresAt: string } | null>(null);
   const [activationError, setActivationError] = useState<string | null>(null);
@@ -219,7 +236,13 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
             </div>
 
             <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between">
-              <span className="text-[10px] text-slate-700">Client depuis : {client.createdAt}</span>
+              <span className="flex items-center gap-2 text-[10px] text-slate-700">
+                Client depuis : {String(client.createdAt).slice(0, 10)}
+                <RowActions
+                  onEdit={isAdmin && onUpdateClient ? () => setEditingClient(client) : undefined}
+                  onDelete={isAdmin && onDeleteClient ? () => setDeletingClient(client) : undefined}
+                />
+              </span>
               <button
                 onClick={() => setSelectedClient(client)}
                 className="flex items-center gap-1 text-xs font-bold text-amber-600 hover:text-amber-700"
@@ -518,6 +541,57 @@ export const ClientsView: React.FC<ClientsViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+      {editingClient && onUpdateClient && (
+        <EditRecordModal
+          title={`Modifier la fiche ${editingClient.code}`}
+          initialValues={editingClient}
+          fields={[
+            { name: 'fullName', label: 'Nom complet', required: true },
+            { name: 'phone', label: 'Téléphone / WhatsApp', type: 'tel', required: true },
+            { name: 'email', label: 'E-mail', type: 'email' },
+            { name: 'city', label: 'Ville' },
+            { name: 'country', label: 'Pays' },
+            { name: 'address', label: 'Adresse', full: true },
+            { name: 'notes', label: 'Notes', type: 'textarea' },
+          ]}
+          onSubmit={(v) =>
+            onUpdateClient(editingClient.id, {
+              fullName: v.fullName,
+              phone: v.phone,
+              email: v.email,
+              city: v.city,
+              country: v.country,
+              address: v.address,
+              notes: v.notes,
+            })
+          }
+          onClose={() => setEditingClient(null)}
+        />
+      )}
+      {deletingClient && onDeleteClient && (
+        <ConfirmDeleteModal
+          title={`Supprimer la fiche ${deletingClient.fullName} ?`}
+          message={
+            deletingRecords.parcels + deletingRecords.payments > 0 ? (
+              <>
+                Ce client possède <strong>{deletingRecords.parcels} colis</strong> et <strong>{deletingRecords.payments} paiement(s)</strong>
+                {deletingRecords.paidUSD > 0 && <> (<strong>{formatUSD(deletingRecords.paidUSD)}</strong> encaissés)</>}. Pour supprimer la fiche, ils doivent
+                être supprimés avec elle : ils disparaîtront des listes, de la caisse et des statistiques. Leur détail complet reste conservé
+                dans le journal d’audit.
+              </>
+            ) : (
+              'La fiche client sera supprimée. L’opération est tracée dans le journal d’audit.'
+            )
+          }
+          acknowledgement={
+            deletingRecords.parcels + deletingRecords.payments > 0
+              ? `Supprimer aussi ses ${deletingRecords.parcels} colis et ${deletingRecords.payments} paiement(s)`
+              : undefined
+          }
+          onConfirm={() => onDeleteClient(deletingClient.id, deletingRecords.parcels + deletingRecords.payments > 0)}
+          onClose={() => setDeletingClient(null)}
+        />
       )}
     </div>
   );

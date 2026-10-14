@@ -41,12 +41,13 @@ const allowed: Record<string, Record<string, Role[]>> = {
   clients: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier'], POST: ['admin', 'china_team', 'kinshasa_team', 'cashier'], PUT: ['admin'], DELETE: ['admin'] },
   parcels: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier', 'client'], POST: ['admin', 'china_team'], PUT: ['admin'], DELETE: ['admin'] },
   shipments: { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier'], POST: ['admin', 'china_team'], PUT: ['admin', 'china_team'], DELETE: ['admin'] },
-  payments: { GET: ['admin', 'cashier', 'client'], POST: ['admin', 'cashier'], DELETE: ['admin'] },
-  expenses: { GET: ['admin', 'cashier'], POST: ['admin', 'cashier'], PUT: ['admin'], DELETE: ['admin'] },
+  payments: { GET: ['admin', 'cashier', 'client'], POST: ['admin', 'cashier'], PUT: ['admin', 'cashier'], DELETE: ['admin'] },
+  expenses: { GET: ['admin', 'cashier'], POST: ['admin', 'cashier'], PUT: ['admin', 'cashier'], DELETE: ['admin'] },
   employees: { GET: ['admin'], POST: ['admin'], PUT: ['admin'], DELETE: ['admin'] },
-  salaries: { GET: ['admin'], POST: ['admin'], DELETE: ['admin'] },
+  salaries: { GET: ['admin'], POST: ['admin'], PUT: ['admin'], DELETE: ['admin'] },
   supabase: { GET: ['admin'], POST: ['admin'] },
   uploads: { POST: ['admin', 'china_team'] },
+  'payment-methods': { GET: ['admin', 'china_team', 'kinshasa_team', 'cashier'], POST: ['admin'], PUT: ['admin'] },
 };
 const PHOTO_BUCKET = 'parcel-photos';
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024;
@@ -57,7 +58,7 @@ class ApiError extends Error {
     super(message);
   }
 }
-const tables = new Set(['users', 'agencies', 'clients', 'parcels', 'shipments', 'payments', 'expenses', 'employees', 'salary_payments', 'audit_logs', 'notifications']);
+const tables = new Set(['payment-methods', 'users', 'agencies', 'clients', 'parcels', 'shipments', 'payments', 'expenses', 'employees', 'salary_payments', 'audit_logs', 'notifications']);
 
 const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
 const anonKey = Deno.env.get('SUPABASE_ANON_KEY')!;
@@ -129,7 +130,89 @@ function ratesResponse(row: any) {
     maritimePricePerCbm: Number(row?.maritime_price_per_cbm) || 0,
     aerienPricePerKg: Number(row?.aerien_price_per_kg) || 0,
     freightRateCurrency: isPricingCurrency(row?.freight_rate_currency) ? row.freight_rate_currency : 'USD',
+    // Default transit delay in days (null = not configured by the administrator).
+    aerienTransitDays: transitDaysOrNull(row?.aerien_transit_days),
+    maritimeTransitDays: transitDaysOrNull(row?.maritime_transit_days),
   };
+}
+
+const transitDaysOrNull = (value: unknown): number | null =>
+  value === null || value === undefined || value === '' || !Number.isInteger(Number(value)) ? null : Number(value);
+
+/** Validates a transit delay: whole number of days between 0 and 365, or empty (null). */
+function parseTransitDays(value: unknown, label: string): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0 || n > 365) throw new ApiError(400, `${label} invalide : saisissez un nombre entier de jours (0 à 365).`);
+  return n;
+}
+
+/** Day (YYYY-MM-DD) + number of days. */
+function addDays(day: string, days: number): string {
+  const date = new Date(`${day}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+/** Validates a calendar day (YYYY-MM-DD) that is not in the future (1 day tolerance for time zones). */
+function parseDay(value: unknown, label: string): string {
+  const day = String(value ?? '');
+  const parsed = /^\d{4}-\d{2}-\d{2}$/.test(day) ? new Date(`${day}T00:00:00Z`) : null;
+  if (!parsed || Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== day) {
+    throw new ApiError(400, `${label} invalide (format attendu : AAAA-MM-JJ).`);
+  }
+  if (parsed.getTime() > Date.now() + 24 * 60 * 60 * 1000) throw new ApiError(400, `${label} ne peut pas être dans le futur.`);
+  return day;
+}
+
+/** Amount in USD for a correction: same currency keeps the original rate, a new currency takes today's rate. */
+function correctionToUsd(amount: number, currency: string, before: { currency: string; exchange_rate: unknown }, rates: ReturnType<typeof ratesResponse>) {
+  if (!isPricingCurrency(currency)) throw new ApiError(400, 'Devise non prise en charge (USD, CNY, CDF ou AOA).');
+  const exchangeRate = currency === 'USD' ? 1 : currency === before.currency ? Number(before.exchange_rate) || currencyRate(currency, rates) : currencyRate(currency, rates);
+  if (!(exchangeRate > 0)) throw new ApiError(400, `Taux de change ${currency} indisponible.`);
+  return { exchangeRate, amountUSD: currency === 'USD' ? roundMoney(amount) : roundMoney(amount / exchangeRate) };
+}
+
+const pick = (row: Record<string, unknown>, keys: string[]) => Object.fromEntries(keys.map((k) => [snakeToCamel(k), row[k] ?? null]));
+
+function correctionError(error: { message?: string }, fallbackLabel: string): never {
+  const message = String(error?.message || '');
+  if (message.includes('INVALID_AMOUNT')) throw new ApiError(400, 'Le montant doit être supérieur à 0.');
+  if (message.includes('SALARY_EXPENSE')) throw new ApiError(400, 'Cette dépense provient d’un bulletin de salaire : modifiez ou supprimez le bulletin dans « Salaires ».');
+  if (message.includes('non trouv')) throw new ApiError(404, `${fallbackLabel} introuvable.`);
+  throw error;
+}
+
+// --- Cash boxes: every receipt/expense belongs to a real agency and a payment
+// method configured for that agency's country (table payment_methods).
+async function assertPaymentMethod(country: string, code: unknown): Promise<string> {
+  const value = String(code ?? '').trim();
+  if (!value) throw new ApiError(400, 'Choisissez le moyen de paiement.');
+  const { data, error } = await db.from('payment_methods').select('code').eq('country', country).eq('code', value).eq('active', true).maybeSingle();
+  if (error) throw error;
+  if (!data) throw new ApiError(400, `Moyen de paiement « ${value} » non disponible pour la caisse ${country}.`);
+  return value;
+}
+
+/** Agency whose cash box receives the money: the cashier's own agency; the admin may choose one. */
+async function resolveCashAgency(actor: Profile, requestedAgencyId: unknown) {
+  const wanted = actor.role === 'admin' && requestedAgencyId ? String(requestedAgencyId) : actor.agency_id;
+  const agency = await loadAgency(wanted || null, 'Agence');
+  if (!agency) throw new ApiError(400, 'Aucune agence n’est rattachée à cette opération : impossible de l’affecter à une caisse. Choisissez une agence.');
+  return agency;
+}
+
+/** Salary slips store a free-text method; map it to the cash box method code. */
+function salaryMethodCode(text: unknown): string | null {
+  const value = String(text || '').toLowerCase();
+  if (/esp[eè]ce|cash/.test(value)) return 'ESPECES';
+  if (/vir|banq|bank/.test(value)) return 'BANQUE';
+  if (/m-?pesa/.test(value)) return 'MPESA';
+  if (/orange/.test(value)) return 'ORANGE_MONEY';
+  if (/airtel/.test(value)) return 'AIRTEL_MONEY';
+  if (/afri/.test(value)) return 'AFRIMONEY';
+  if (/alipay/.test(value)) return 'ALIPAY';
+  return null;
 }
 
 async function loadAgency(agencyId: string | null, label: string): Promise<{ id: string; name: string; country: string; type: string } | null> {
@@ -418,7 +501,19 @@ async function createParcel(body: any, actor: Profile) {
     throw new ApiError(400, 'Date de réception invalide (format attendu : AAAA-MM-JJ).');
   }
   if (parsedReception.getTime() > Date.now() + 24 * 60 * 60 * 1000) throw new ApiError(400, 'La date de réception ne peut pas être dans le futur.');
+  // Transit delay: value typed in the form, otherwise the default delay of the transport mode.
+  const transitDays = body.estimatedTransitDays !== undefined && body.estimatedTransitDays !== null && body.estimatedTransitDays !== ''
+    ? parseTransitDays(body.estimatedTransitDays, 'Délai d’acheminement')
+    : transportMode === 'AERIEN' ? rates.aerienTransitDays : rates.maritimeTransitDays;
 
+  // The down payment goes to the cash box of the China agency (else the agent's agency).
+  let cashAgency: Awaited<ReturnType<typeof loadAgency>> = null;
+  let downPaymentMethod = 'ESPECES';
+  if (price.amountPaid > 0) {
+    cashAgency = chinaAgency ?? (await loadAgency(actor.agency_id, 'Agence'));
+    if (!cashAgency) throw new ApiError(400, 'Aucune agence n’est rattachée à cet acompte : choisissez l’agence Chine du colis.');
+    downPaymentMethod = await assertPaymentMethod(cashAgency.country, body.paymentMethod || 'ESPECES');
+  }
   const seq = await nextSequence('parcel');
   const receiptSeq = price.amountPaid > 0 ? await nextSequence('payment') : 0;
   const weight = weightKg;
@@ -448,10 +543,12 @@ async function createParcel(body: any, actor: Profile) {
     transport_cost_usd: price.transportCostUSD, extra_fees_usd: price.extraFeesUSD,
     total_cost_usd: price.totalCostUSD, amount_paid_usd: 0, remaining_amount_usd: price.totalCostUSD,
     warehouse_location: body.warehouseLocation || '', comments: body.comments || '', created_at: now, updated_at: now,
+    estimated_transit_days: transitDays,
+    estimated_arrival_date: transitDays !== null ? addDays(receptionDate, transitDays) : null,
   };
   let payment: Record<string, unknown> | null = null;
   if (price.amountPaid > 0) {
-    payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(receiptSeq).padStart(4, '0')}`, parcel_id: parcelId, parcel_tracking_number: tracking, client_id: parcel.client_id, client_name: parcel.client_name, type: 'AVANCE', original_amount: price.amountPaid, currency: price.currency, exchange_rate: price.exchangeRate, amount_usd: price.amountPaidUSD, payment_method: body.paymentMethod || 'ESPECES', date: now, time: nowTime(), agency_id: parcel.china_agency_id, agency_name: parcel.china_agency_name, cashier_id: actor.id, cashier_name: actor.full_name, notes: `Acompte initial du colis ${tracking}` };
+    payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(receiptSeq).padStart(4, '0')}`, parcel_id: parcelId, parcel_tracking_number: tracking, client_id: parcel.client_id, client_name: parcel.client_name, type: 'AVANCE', original_amount: price.amountPaid, currency: price.currency, exchange_rate: price.exchangeRate, amount_usd: price.amountPaidUSD, payment_method: downPaymentMethod, date: now, time: nowTime(), agency_id: cashAgency?.id ?? null, agency_name: cashAgency?.name ?? '', cashier_id: actor.id, cashier_name: actor.full_name, notes: `Acompte initial du colis ${tracking}` };
   }
   const { data, error } = await db.rpc('create_parcel_transaction', {
     parcel_data: parcel,
@@ -474,13 +571,15 @@ async function createPayment(body: any, actor: Profile, scoped: any) {
     if (!data) throw new ApiError(404, 'Colis introuvable ou hors de votre agence.');
     parcelRow = data;
   }
+  const cashAgency = await resolveCashAgency(actor, body.agencyId);
+  const paymentMethod = await assertPaymentMethod(cashAgency.country, body.paymentMethod);
   const seq = await nextSequence('payment');
   const { data: ratesRow, error: ratesError } = await db.from('exchange_rates').select('*').limit(1).maybeSingle();
   if (ratesError) throw ratesError;
   const currency = body.currency || 'USD', amount = Number(body.originalAmount) || 0;
   const rates = { CNY: Number(ratesRow?.cny_rate) || 7.25, CDF: Number(ratesRow?.cdf_rate) || 2850, AOA: Number(ratesRow?.aoa_rate) || 920 };
   const { exchangeRate, amountUSD } = ratesToUsd(currency, amount, rates);
-  const payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, parcel_id: parcelRow?.id ?? null, parcel_tracking_number: parcelRow?.tracking_number ?? null, client_id: parcelRow ? parcelRow.client_id : body.clientId || null, client_name: parcelRow?.client_name ?? body.clientName, type: body.type || 'AVANCE', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, payment_method: body.paymentMethod || 'ESPECES', reference: body.reference || '', date: body.date || today(), time: nowTime(), agency_id: actor.agency_id, agency_name: actor.agency_name, cashier_id: actor.id, cashier_name: actor.full_name, notes: body.notes || '' };
+  const payment = { id: id('PAY'), receipt_number: `REC-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, parcel_id: parcelRow?.id ?? null, parcel_tracking_number: parcelRow?.tracking_number ?? null, client_id: parcelRow ? parcelRow.client_id : body.clientId || null, client_name: parcelRow?.client_name ?? body.clientName, type: body.type || 'AVANCE', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, payment_method: paymentMethod, reference: body.reference || '', date: body.date || today(), time: nowTime(), agency_id: cashAgency.id, agency_name: cashAgency.name, cashier_id: actor.id, cashier_name: actor.full_name, notes: body.notes || '' };
   const { data, error } = await db.rpc('record_payment_transaction', {
     payment_data: payment,
     audit_data: auditRow(actor, 'PAYMENT', 'PAYMENT', payment.id, `Encaissement ${payment.receipt_number} de ${amount} ${currency}`),
@@ -491,13 +590,16 @@ async function createPayment(body: any, actor: Profile, scoped: any) {
 }
 
 async function createExpense(body: any, actor: Profile) {
+  if (!(Number(body.originalAmount) > 0)) throw new ApiError(400, 'Le montant de la dépense doit être supérieur à 0.');
+  const cashAgency = await resolveCashAgency(actor, body.agencyId);
+  const paymentMethod = await assertPaymentMethod(cashAgency.country, body.paymentMethod);
   const seq = await nextSequence('expense');
   const { data: ratesRow, error: ratesError } = await db.from('exchange_rates').select('*').limit(1).maybeSingle();
   if (ratesError) throw ratesError;
   const currency = body.currency || 'USD', amount = Number(body.originalAmount) || 0;
   const rates = { CNY: Number(ratesRow?.cny_rate) || 7.25, CDF: Number(ratesRow?.cdf_rate) || 2850, AOA: Number(ratesRow?.aoa_rate) || 920 };
   const { exchangeRate, amountUSD } = ratesToUsd(currency, amount, rates);
-  const expense = { id: id('DEP'), voucher_number: `DEP-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, category: body.category || 'autres', category_label: body.categoryLabel || body.category || 'Autres', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, agency_id: actor.agency_id, agency_name: actor.agency_name, country: body.country || 'RDC', beneficiary: body.beneficiary || '', date: body.date || today(), time: nowTime(), recorded_by: actor.full_name, description: body.description || '', attachment_name: body.attachmentName || null, attachment_url: body.attachmentUrl || null };
+  const expense = { id: id('DEP'), voucher_number: `DEP-${new Date().getFullYear()}-${String(seq).padStart(4, '0')}`, category: body.category || 'autres', category_label: body.categoryLabel || body.category || 'Autres', original_amount: amount, currency, exchange_rate: exchangeRate, amount_usd: amountUSD, agency_id: cashAgency.id, agency_name: cashAgency.name, country: cashAgency.country, payment_method: paymentMethod, beneficiary: body.beneficiary || '', date: body.date || today(), time: nowTime(), recorded_by: actor.full_name, description: body.description || '', attachment_name: body.attachmentName || null, attachment_url: body.attachmentUrl || null };
   const { data, error } = await db.rpc('create_expense_transaction', {
     expense_data: expense,
     audit_data: auditRow(actor, 'EXPENSE', 'EXPENSE', expense.id, `Dépense ${expense.voucher_number} : ${amount} ${currency}`),
@@ -578,10 +680,10 @@ async function handle(request: Request): Promise<Response> {
       if (!visible) return json({ error: 'Enregistrement introuvable ou hors de votre agence.' }, 404);
     }
     if (isPublicTrack) {
-      const { data, error } = await db.from('parcels').select('tracking_number,transport_mode,destination,destination_agency_name,status,status_history').eq('tracking_number', parts[1].toUpperCase()).maybeSingle();
+      const { data, error } = await db.from('parcels').select('tracking_number,transport_mode,destination,destination_agency_name,status,status_history,estimated_arrival_date').eq('tracking_number', parts[1].toUpperCase()).maybeSingle();
       if (error) throw error;
       if (!data) return json({ error: 'Aucun colis trouvé avec ce numéro de suivi.' }, 404);
-      return json({ trackingNumber: data.tracking_number, transportMode: data.transport_mode, destination: data.destination, destinationAgencyName: data.destination_agency_name, status: data.status, statusHistory: (data.status_history || []).map(({ status, date, time }: any) => ({ status, date, time })) });
+      return json({ trackingNumber: data.tracking_number, transportMode: data.transport_mode, destination: data.destination, destinationAgencyName: data.destination_agency_name, status: data.status, estimatedArrivalDate: data.estimated_arrival_date ?? null, statusHistory: (data.status_history || []).map(({ status, date, time }: any) => ({ status, date, time })) });
     }
 
     if (table === 'auth') return json({ error: 'Utilisez Supabase Auth.' }, 404);
@@ -655,14 +757,16 @@ async function handle(request: Request): Promise<Response> {
         maritime_price_per_cbm: roundMoney(positive(input.maritimePricePerCbm, current.maritimePricePerCbm, 'Tarif maritime/CBM', true)),
         aerien_price_per_kg: roundMoney(positive(input.aerienPricePerKg, current.aerienPricePerKg, 'Tarif aérien/kg', true)),
         freight_rate_currency: input.freightRateCurrency ?? current.freightRateCurrency,
+        aerien_transit_days: input.aerienTransitDays !== undefined ? parseTransitDays(input.aerienTransitDays, 'Délai aérien') : current.aerienTransitDays,
+        maritime_transit_days: input.maritimeTransitDays !== undefined ? parseTransitDays(input.maritimeTransitDays, 'Délai maritime') : current.maritimeTransitDays,
         last_updated: today(),
       };
       const { data: saved, error } = await db.from('exchange_rates').upsert(rates).select('*').single();
       if (error) throw error;
-      const tariffChanged = rates.maritime_price_per_cbm !== current.maritimePricePerCbm || rates.aerien_price_per_kg !== current.aerienPricePerKg || rates.freight_rate_currency !== current.freightRateCurrency;
+      const tariffChanged = rates.maritime_price_per_cbm !== current.maritimePricePerCbm || rates.aerien_price_per_kg !== current.aerienPricePerKg || rates.freight_rate_currency !== current.freightRateCurrency || rates.aerien_transit_days !== current.aerienTransitDays || rates.maritime_transit_days !== current.maritimeTransitDays;
       await audit(actor!, 'UPDATE', 'SETTINGS', 'EXCHANGE_RATES',
         tariffChanged
-          ? `Mise à jour des taux et des tarifs fret (aérien ${rates.aerien_price_per_kg} ${rates.freight_rate_currency}/kg, maritime ${rates.maritime_price_per_cbm} ${rates.freight_rate_currency}/CBM)`
+          ? `Mise à jour des taux et des tarifs fret (aérien ${rates.aerien_price_per_kg} ${rates.freight_rate_currency}/kg, maritime ${rates.maritime_price_per_cbm} ${rates.freight_rate_currency}/CBM ; délais aérien ${rates.aerien_transit_days ?? '—'} j, maritime ${rates.maritime_transit_days ?? '—'} j)`
           : 'Mise à jour des taux de change',
         current, ratesResponse(saved));
       return json(ratesResponse(saved));
@@ -745,6 +849,46 @@ async function handle(request: Request): Promise<Response> {
       await audit(actor!, 'CREATE', 'CLIENT', client.id, `Création du client ${client.full_name}`);
       return json(fromRow(client), 201);
     }
+    if (route === 'payment-methods' && method === 'GET') {
+      const { data, error } = await scoped.from('payment_methods').select('*').order('country').order('sort_order');
+      if (error) throw error;
+      return json((data || []).map(fromRow));
+    }
+    if (route === 'payment-methods' && method === 'POST' && !resourceId) {
+      const input = body as any;
+      const country = String(input.country || '');
+      const label = String(input.label || '').trim();
+      if (!['Chine', 'RDC', 'Angola'].includes(country)) return json({ error: 'Pays invalide (Chine, RDC ou Angola).' }, 400);
+      if (!label) return json({ error: 'Nom du moyen de paiement obligatoire.' }, 400);
+      const kind = ['cash', 'bank', 'mobile'].includes(input.kind) ? input.kind : 'mobile';
+      const code = label.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40);
+      if (!code) return json({ error: 'Nom du moyen de paiement invalide.' }, 400);
+      const { data: existing } = await db.from('payment_methods').select('id').eq('country', country).eq('code', code).maybeSingle();
+      if (existing) return json({ error: `« ${label} » existe déjà pour la caisse ${country}.` }, 409);
+      const { count } = await db.from('payment_methods').select('*', { count: 'exact', head: true }).eq('country', country);
+      const row = { id: id('PM'), country, code, label, kind, active: true, sort_order: (count || 0) + 1 };
+      const { error } = await db.from('payment_methods').insert(row);
+      if (error) throw error;
+      await audit(actor!, 'CREATE', 'SETTINGS', row.id, `Ajout du moyen de paiement « ${label} » (caisse ${country})`);
+      return json(fromRow(row), 201);
+    }
+    if (route === 'payment-methods' && method === 'PUT' && resourceId) {
+      const input = body as any;
+      const patch: Record<string, unknown> = {};
+      if (input.label !== undefined) {
+        if (!String(input.label).trim()) return json({ error: 'Nom du moyen de paiement obligatoire.' }, 400);
+        patch.label = String(input.label).trim();
+      }
+      if (input.active !== undefined) patch.active = !!input.active;
+      if (input.sortOrder !== undefined) patch.sort_order = Number(input.sortOrder) || 0;
+      // The code is never changed: past receipts/expenses reference it.
+      const { data, error } = await db.from('payment_methods').update(patch).eq('id', resourceId).select('*').maybeSingle();
+      if (error) throw error;
+      if (!data) return json({ error: 'Moyen de paiement introuvable.' }, 404);
+      await audit(actor!, 'UPDATE', 'SETTINGS', resourceId, `Moyen de paiement « ${data.label} » (caisse ${data.country}) ${data.active ? 'actif' : 'désactivé'}`);
+      return json(fromRow(data));
+    }
+
     if (table === 'agencies' && method === 'POST' && !resourceId) {
       const input = body as any;
       const text = (value: unknown) => String(value ?? '').trim();
@@ -793,7 +937,7 @@ async function handle(request: Request): Promise<Response> {
       let expense: Record<string, unknown> | null = null;
       if (salary.status === 'PAYE') {
         const expenseSeq = await nextSequence('expense');
-        expense = { id: id('DEP'), voucher_number: `DEP-${new Date().getFullYear()}-${String(expenseSeq).padStart(4, '0')}`, category: 'salaire', category_label: 'Salaires & Rémunérations', original_amount: salary.paid_amount_original, currency, exchange_rate: exchangeRate, amount_usd: net, agency_id: input.agencyId || actor!.agency_id, agency_name: salary.agency_name, country: salary.country, beneficiary: salary.employee_name, date: salary.payment_date, time: nowTime(), recorded_by: actor!.full_name, description: `Règlement salaire ${period} [Bulletin ${salary.slip_number}]` };
+        expense = { id: id('DEP'), voucher_number: `DEP-${new Date().getFullYear()}-${String(expenseSeq).padStart(4, '0')}`, category: 'salaire', category_label: 'Salaires & Rémunérations', original_amount: salary.paid_amount_original, currency, exchange_rate: exchangeRate, amount_usd: net, agency_id: input.agencyId || actor!.agency_id, agency_name: salary.agency_name, country: salary.country, payment_method: salaryMethodCode(salary.payment_method), beneficiary: salary.employee_name, date: salary.payment_date, time: nowTime(), recorded_by: actor!.full_name, description: `Règlement salaire ${period} [Bulletin ${salary.slip_number}]` };
       }
       const { data, error } = await db.rpc('create_salary_transaction', { salary_data: salary, expense_data: expense, audit_data: auditRow(actor!, 'PAYMENT', 'EMPLOYEE', salary.id, `Émission bulletin ${salary.slip_number} (${net} USD)`) });
       if (error) throw error;
@@ -905,12 +1049,27 @@ async function handle(request: Request): Promise<Response> {
       if (!input.email || !input.fullName || !input.username || !input.role) return json({ error: 'Nom, identifiant, rôle et e-mail requis.' }, 400);
       // Validate role + agency before sending the invitation e-mail.
       const agency = await resolveStaffAgency(input.role, input.agencyId);
-      const { data: invited, error: inviteError } = await db.auth.admin.inviteUserByEmail(input.email, { data: { full_name: input.fullName } });
-      if (inviteError) throw inviteError;
+      const email = String(input.email).trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: 'Adresse e-mail invalide.' }, 400);
+      // With an initial password the account is usable immediately (no e-mail sent);
+      // otherwise Supabase sends an invitation e-mail. The password never leaves Supabase Auth.
+      let authResult;
+      if (input.password !== undefined && input.password !== '') {
+        if (String(input.password).length < 8) return json({ error: 'Le mot de passe initial doit contenir au moins 8 caractères.' }, 400);
+        authResult = await db.auth.admin.createUser({ email, password: String(input.password), email_confirm: true, user_metadata: { full_name: input.fullName } });
+      } else {
+        authResult = await db.auth.admin.inviteUserByEmail(email, { data: { full_name: input.fullName } });
+      }
+      const { data: invited, error: inviteError } = authResult;
+      if (inviteError) {
+        if (/already|registered|exists/i.test(inviteError.message || '')) return json({ error: 'Cette adresse e-mail a déjà un compte.' }, 409);
+        throw inviteError;
+      }
+      input.email = email;
       const user = { id: id('USR'), username: input.username, full_name: input.fullName, email: input.email, phone: input.phone || '', role: input.role, agency_id: agency?.id ?? null, agency_name: agency?.name ?? null, status: 'active', created_at: new Date().toISOString(), auth_user_id: invited.user.id };
       const { error } = await db.from('users').insert(user);
       if (error) { await db.auth.admin.deleteUser(invited.user.id); throw error; }
-      await audit(actor!, 'CREATE', 'USER', user.id, `Invitation de ${user.full_name} (${user.role})`);
+      await audit(actor!, 'CREATE', 'USER', user.id, `${input.password ? 'Création' : 'Invitation'} de ${user.full_name} (${user.role}${user.agency_name ? ' • ' + user.agency_name : ''})`);
       const { auth_user_id: _authId, ...safe } = user;
       return json(fromRow(safe), 201);
     }
@@ -934,12 +1093,137 @@ async function handle(request: Request): Promise<Response> {
         patch.agency_id = agency?.id ?? null;
         patch.agency_name = agency?.name ?? null;
       }
+      if (resourceId === actor!.id && patch.status === 'inactive') return json({ error: 'Vous ne pouvez pas désactiver votre propre compte.' }, 400);
+      const { data: beforeUser, error: beforeError } = await db.from('users').select('*').eq('id', resourceId).maybeSingle();
+      if (beforeError) throw beforeError;
+      if (!beforeUser) return json({ error: 'Utilisateur non trouvé.' }, 404);
+      if (patch.email !== undefined) {
+        patch.email = String(patch.email).trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(patch.email))) return json({ error: 'Adresse e-mail invalide.' }, 400);
+        if (patch.email !== beforeUser.email && beforeUser.auth_user_id) {
+          const { error: emailError } = await db.auth.admin.updateUserById(beforeUser.auth_user_id, { email: patch.email, email_confirm: true });
+          if (emailError) throw new ApiError(400, `Changement d’e-mail refusé : ${emailError.message}`);
+        }
+      }
       const { data, error } = await db.from('users').update(patch).eq('id', resourceId).select('*').maybeSingle();
       if (error) throw error;
       if (!data) return json({ error: 'Utilisateur non trouvé.' }, 404);
-      await audit(actor!, 'UPDATE', 'USER', resourceId, `Mise à jour du profil ${data.username}`);
+      const userKeys = ['username', 'full_name', 'email', 'phone', 'role', 'agency_name', 'status'];
+      await audit(actor!, 'UPDATE', 'USER', resourceId, `Mise à jour du profil ${data.username}`, pick(beforeUser, userKeys), pick(data, userKeys));
       const { auth_user_id: _authUserId, ...safe } = data;
       return json(fromRow(safe));
+    }
+
+    // Admin-only password reset: the new password goes straight to Supabase Auth, never stored or logged.
+    if (table === 'users' && resourceId && parts[2] === 'password' && method === 'POST') {
+      const password = String((body as any).password ?? '');
+      if (password.length < 8) return json({ error: 'Le nouveau mot de passe doit contenir au moins 8 caractères.' }, 400);
+      const { data: target, error: targetError } = await db.from('users').select('id,full_name,auth_user_id,role').eq('id', resourceId).maybeSingle();
+      if (targetError) throw targetError;
+      if (!target) return json({ error: 'Utilisateur non trouvé.' }, 404);
+      if (!target.auth_user_id) return json({ error: 'Ce profil n’a pas de compte de connexion.' }, 400);
+      const { error: pwdError } = await db.auth.admin.updateUserById(target.auth_user_id, { password });
+      if (pwdError) throw new ApiError(400, `Réinitialisation refusée : ${pwdError.message}`);
+      await audit(actor!, 'UPDATE', 'USER', resourceId, `Réinitialisation du mot de passe de ${target.full_name}`);
+      return json({ success: true, message: `Mot de passe de ${target.full_name} réinitialisé.` });
+    }
+
+    // Correction of a receipt: amount/currency/method/date; balances recalculated in SQL.
+    if (table === 'payments' && resourceId && method === 'PUT') {
+      const input = body as any;
+      const { data: before, error: beforeError } = await db.from('payments').select('*').eq('id', resourceId).maybeSingle();
+      if (beforeError) throw beforeError;
+      if (!before) return json({ error: 'Paiement non trouvé.' }, 404);
+      const amount = input.originalAmount !== undefined ? Number(input.originalAmount) : Number(before.original_amount);
+      if (!Number.isFinite(amount) || amount <= 0) return json({ error: 'Le montant doit être supérieur à 0.' }, 400);
+      const currency = input.currency ?? before.currency;
+      const { exchangeRate, amountUSD } = correctionToUsd(amount, currency, before, ratesResponse(await loadRatesRow()));
+      // Only the admin may move a receipt to another cash box (e.g. receipts recorded without agency).
+      const agencyChanged = input.agencyId !== undefined && input.agencyId !== before.agency_id;
+      if (agencyChanged && actor!.role !== 'admin') return json({ error: 'Seul l’administrateur peut changer la caisse d’un encaissement.' }, 403);
+      const cashAgency = agencyChanged ? await loadAgency(input.agencyId ? String(input.agencyId) : null, 'Agence') : await loadAgency(before.agency_id, 'Agence');
+      if (agencyChanged && !cashAgency) return json({ error: 'Choisissez l’agence (caisse) de cet encaissement.' }, 400);
+      const methodChanged = input.paymentMethod !== undefined && input.paymentMethod !== before.payment_method;
+      const patch = {
+        original_amount: roundMoney(amount), currency, exchange_rate: exchangeRate, amount_usd: amountUSD,
+        agency_id: cashAgency?.id ?? null, agency_name: cashAgency?.name ?? before.agency_name,
+        payment_method: methodChanged || agencyChanged
+          ? await assertPaymentMethod(cashAgency?.country || '', input.paymentMethod ?? before.payment_method)
+          : before.payment_method,
+        reference: input.reference ?? before.reference,
+        notes: input.notes ?? before.notes, type: input.type ?? before.type,
+        date: input.date !== undefined ? parseDay(input.date, 'Date du paiement') : before.date,
+      };
+      const keys = ['original_amount', 'currency', 'amount_usd', 'agency_name', 'payment_method', 'reference', 'notes', 'type', 'date'];
+      const { data, error } = await db.rpc('update_payment_transaction', {
+        target_id: resourceId, patch,
+        audit_data: auditRow(actor!, 'UPDATE', 'PAYMENT', resourceId, `Correction du reçu ${before.receipt_number} : ${before.original_amount} ${before.currency} → ${patch.original_amount} ${patch.currency}`, pick(before, keys), pick(patch, keys)),
+      });
+      if (error) correctionError(error, 'Paiement');
+      return json(fromRow(data));
+    }
+
+    if (table === 'expenses' && resourceId && method === 'PUT') {
+      const input = body as any;
+      const { data: before, error: beforeError } = await db.from('expenses').select('*').eq('id', resourceId).maybeSingle();
+      if (beforeError) throw beforeError;
+      if (!before) return json({ error: 'Dépense non trouvée.' }, 404);
+      if (before.category === 'salaire' || input.category === 'salaire') {
+        return json({ error: 'Cette dépense provient d’un bulletin de salaire : modifiez ou supprimez le bulletin dans « Salaires ».' }, 400);
+      }
+      const amount = input.originalAmount !== undefined ? Number(input.originalAmount) : Number(before.original_amount);
+      if (!Number.isFinite(amount) || amount <= 0) return json({ error: 'Le montant doit être supérieur à 0.' }, 400);
+      const country = input.country ?? before.country;
+      if (!['Chine', 'RDC', 'Angola'].includes(country)) return json({ error: 'Pays invalide (Chine, RDC ou Angola).' }, 400);
+      const currency = input.currency ?? before.currency;
+      const { exchangeRate, amountUSD } = correctionToUsd(amount, currency, before, ratesResponse(await loadRatesRow()));
+      const patch = {
+        category: input.category ?? before.category, category_label: input.categoryLabel ?? input.category ?? before.category_label,
+        original_amount: roundMoney(amount), currency, exchange_rate: exchangeRate, amount_usd: amountUSD,
+        beneficiary: input.beneficiary ?? before.beneficiary, description: input.description ?? before.description, country,
+        payment_method: input.paymentMethod !== undefined && input.paymentMethod !== before.payment_method
+          ? await assertPaymentMethod(country, input.paymentMethod)
+          : before.payment_method,
+        date: input.date !== undefined ? parseDay(input.date, 'Date de la dépense') : before.date,
+      };
+      const keys = ['category_label', 'original_amount', 'currency', 'amount_usd', 'beneficiary', 'description', 'country', 'payment_method', 'date'];
+      const { data, error } = await db.rpc('update_expense_transaction', {
+        target_id: resourceId, patch,
+        audit_data: auditRow(actor!, 'UPDATE', 'EXPENSE', resourceId, `Correction de la dépense ${before.voucher_number} : ${before.original_amount} ${before.currency} → ${patch.original_amount} ${patch.currency}`, pick(before, keys), pick(patch, keys)),
+      });
+      if (error) correctionError(error, 'Dépense');
+      return json(fromRow(data));
+    }
+
+    if (table === 'salary_payments' && resourceId && method === 'PUT') {
+      const input = body as any;
+      const { data: before, error: beforeError } = await db.from('salary_payments').select('*').eq('id', resourceId).maybeSingle();
+      if (beforeError) throw beforeError;
+      if (!before) return json({ error: 'Bulletin de paie non trouvé.' }, 404);
+      const num = (key: string, column: string) => {
+        const value = input[key] !== undefined ? Number(input[key]) : Number(before[column] || 0);
+        if (!Number.isFinite(value) || value < 0) throw new ApiError(400, 'Les montants du bulletin doivent être positifs ou nuls.');
+        return roundMoney(value);
+      };
+      const base = num('baseSalaryUSD', 'base_salary_usd'), primes = num('primesUSD', 'primes_usd'), avances = num('avancesUSD', 'avances_usd');
+      const retenues = num('retenuesUSD', 'retenues_usd'), overtime = num('overtimeUSD', 'overtime_usd');
+      const net = roundMoney(base + primes + overtime - avances - retenues);
+      if (net < 0) return json({ error: 'Le salaire net ne peut pas être négatif (avances et retenues trop élevées).' }, 400);
+      const currency = input.currency ?? before.currency;
+      const { exchangeRate } = correctionToUsd(1, currency, before, ratesResponse(await loadRatesRow()));
+      const patch = {
+        base_salary_usd: base, primes_usd: primes, avances_usd: avances, retenues_usd: retenues, overtime_usd: overtime, net_salary_usd: net,
+        paid_amount_original: currency === 'USD' ? net : roundMoney(net * exchangeRate), currency, exchange_rate: exchangeRate,
+        payment_method: input.paymentMethod ?? before.payment_method, notes: input.notes ?? before.notes,
+        payment_date: input.paymentDate !== undefined ? parseDay(input.paymentDate, 'Date de paiement') : before.payment_date,
+      };
+      const keys = ['base_salary_usd', 'primes_usd', 'avances_usd', 'retenues_usd', 'overtime_usd', 'net_salary_usd', 'currency', 'payment_method', 'payment_date', 'notes'];
+      const { data, error } = await db.rpc('update_salary_transaction', {
+        target_id: resourceId, patch,
+        audit_data: auditRow(actor!, 'UPDATE', 'SALARY', resourceId, `Correction du bulletin ${before.slip_number} : net ${before.net_salary_usd} → ${net} USD`, pick(before, keys), pick(patch, keys)),
+      });
+      if (error) correctionError(error, 'Bulletin de paie');
+      return json(fromRow(data));
     }
 
     if (method === 'GET' && resourceId && table !== 'supabase') {
@@ -964,10 +1248,36 @@ async function handle(request: Request): Promise<Response> {
       delete patch.id;
       delete patch.auth_user_id;
       delete patch.password;
+      if (table === 'employees') {
+        if (patch.full_name !== undefined && !String(patch.full_name).trim()) return json({ error: 'Nom de l’employé obligatoire.' }, 400);
+        if (patch.base_salary_usd !== undefined && !(Number(patch.base_salary_usd) > 0)) return json({ error: 'Salaire de base obligatoire (montant supérieur à 0).' }, 400);
+        if (patch.agency_id !== undefined) {
+          const employeeAgency = await loadAgency(patch.agency_id ? String(patch.agency_id) : null, 'Agence');
+          patch.agency_id = employeeAgency?.id ?? null;
+          patch.agency_name = employeeAgency?.name ?? null;
+          if (employeeAgency) patch.country = employeeAgency.country;
+        }
+        if (patch.status !== undefined && !['actif', 'inactif', 'conge'].includes(String(patch.status))) return json({ error: 'Statut employé invalide.' }, 400);
+      }
+      if (table === 'clients') {
+        for (const key of ['total_parcels', 'total_amount_usd', 'total_paid_usd', 'remaining_balance_usd', 'code']) delete patch[key];
+        if (patch.full_name !== undefined && !String(patch.full_name).trim()) return json({ error: 'Nom du client obligatoire.' }, 400);
+        if (patch.phone !== undefined && !String(patch.phone).trim()) return json({ error: 'Téléphone du client obligatoire.' }, 400);
+      }
       if (table === 'parcels') {
         // Totals, payments and the tariff snapshot are derived server-side only.
         // The transport mode fixes the pricing basis (kg / CBM) and is frozen too.
-        for (const key of ['total_cost_usd', 'amount_paid_usd', 'remaining_amount_usd', 'price_per_kg', 'price_per_cbm', 'pricing_unit', 'pricing_exchange_rate', 'pricing_currency', 'freight_amount', 'total_amount', 'transport_mode']) delete patch[key];
+        for (const key of ['total_cost_usd', 'amount_paid_usd', 'remaining_amount_usd', 'price_per_kg', 'price_per_cbm', 'pricing_unit', 'pricing_exchange_rate', 'pricing_currency', 'freight_amount', 'total_amount', 'transport_mode', 'estimated_arrival_date']) delete patch[key];
+        if (patch.estimated_transit_days !== undefined || patch.china_reception_date !== undefined) {
+          const { data: current, error: currentError } = await db.from('parcels').select('china_reception_date, created_at, estimated_transit_days').eq('id', resourceId).maybeSingle();
+          if (currentError) throw currentError;
+          if (!current) return json({ error: 'Colis non trouvé.' }, 404);
+          if (patch.estimated_transit_days !== undefined) patch.estimated_transit_days = parseTransitDays(patch.estimated_transit_days, 'Délai d’acheminement');
+          if (patch.china_reception_date !== undefined) patch.china_reception_date = parseDay(patch.china_reception_date, 'Date de réception');
+          const days = patch.estimated_transit_days !== undefined ? patch.estimated_transit_days : current.estimated_transit_days;
+          const start = String(patch.china_reception_date ?? current.china_reception_date ?? current.created_at ?? '').slice(0, 10);
+          patch.estimated_arrival_date = days !== null && days !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(start) ? addDays(start, Number(days)) : null;
+        }
         const measureKeys = ['weight_kg', 'length_cm', 'width_cm', 'height_cm', 'volume_cbm', 'transport_cost_usd', 'extra_fees_usd'];
         if (measureKeys.some((key) => patch[key] !== undefined)) {
           const { data: existing, error: existingError } = await db.from('parcels').select('*').eq('id', resourceId).maybeSingle();
@@ -1022,11 +1332,41 @@ async function handle(request: Request): Promise<Response> {
         if ((count || 0) > 0) return json({ error: 'Suppression impossible : cet employé possède un historique de paie. Désactivez plutôt son profil.' }, 400);
       }
       if (table === 'clients') {
-        const [{ count: parcelCount }, { count: paymentCount }] = await Promise.all([
-          db.from('parcels').select('*', { count: 'exact', head: true }).eq('client_id', resourceId),
-          db.from('payments').select('*', { count: 'exact', head: true }).eq('client_id', resourceId),
-        ]);
-        if ((parcelCount || 0) + (paymentCount || 0) > 0) return json({ error: `Suppression impossible : ce client possède ${parcelCount || 0} colis et ${paymentCount || 0} paiements.` }, 400);
+        const { data: clientRow, error: clientRowError } = await db.from('clients').select('*').eq('id', resourceId).maybeSingle();
+        if (clientRowError) throw clientRowError;
+        if (!clientRow) return json({ error: 'Client non trouvé.' }, 404);
+        const { data: clientParcels, error: parcelsError } = await db.from('parcels').select('*').eq('client_id', resourceId);
+        if (parcelsError) throw parcelsError;
+        const parcelIds = ((clientParcels || []) as any[]).map((p) => p.id);
+        const { data: byClient, error: payError } = await db.from('payments').select('*').eq('client_id', resourceId);
+        if (payError) throw payError;
+        let byParcel: any[] = [];
+        if (parcelIds.length > 0) {
+          const { data, error: byParcelError } = await db.from('payments').select('*').in('parcel_id', parcelIds);
+          if (byParcelError) throw byParcelError;
+          byParcel = data || [];
+        }
+        const clientPayments = [...new Map([...(byClient || []), ...byParcel].map((p: any) => [p.id, p])).values()];
+        const parcelCount = parcelIds.length, paymentCount = clientPayments.length;
+        if (parcelCount + paymentCount > 0) {
+          // Deleting a client's parcels and receipts must be an explicit admin choice.
+          if (url.searchParams.get('withRecords') !== 'true') {
+            return json({
+              error: `Ce client possède ${parcelCount} colis et ${paymentCount} paiement(s). Cochez « Supprimer aussi ses colis et paiements » pour tout supprimer.`,
+              parcelsCount: parcelCount,
+              paymentsCount: paymentCount,
+            }, 409);
+          }
+          const paidUSD = roundMoney(clientPayments.reduce((sum: number, p: any) => sum + Number(p.amount_usd || 0), 0));
+          const { error } = await db.rpc('delete_client_cascade_transaction', {
+            target_id: resourceId,
+            audit_data: auditRow(actor!, 'DELETE', 'CLIENT', resourceId,
+              `Suppression du client ${clientRow.full_name} (${clientRow.code}) avec ${parcelCount} colis (${((clientParcels || []) as any[]).map((p) => p.tracking_number).join(', ') || '—'}) et ${paymentCount} reçu(s) (${clientPayments.map((p: any) => p.receipt_number).join(', ') || '—'}) — total encaissé ${paidUSD} $`,
+              { client: clientRow, parcels: clientParcels, payments: clientPayments }, null),
+          });
+          if (error) throw error;
+          return json({ success: true, message: `Client ${clientRow.full_name} supprimé avec ${parcelCount} colis et ${paymentCount} paiement(s).` });
+        }
       }
       if (table === 'parcels') {
         const { data: linkedPayments, error: linkedError } = await db.from('payments').select('id,receipt_number,original_amount,currency,amount_usd,client_id').eq('parcel_id', resourceId);
@@ -1057,6 +1397,9 @@ async function handle(request: Request): Promise<Response> {
       }
       const { data: before } = await db.from(table).select('*').eq('id', resourceId).maybeSingle();
       if (!before) return json({ error: 'Enregistrement non trouvé.' }, 404);
+      if (table === 'expenses' && before.category === 'salaire') {
+        return json({ error: 'Cette dépense provient d’un bulletin de salaire : supprimez le bulletin dans « Salaires ».' }, 400);
+      }
       if (table === 'payments') {
         const { error } = await db.rpc('delete_payment_transaction', { target_id: resourceId, audit_data: auditRow(actor!, 'DELETE', 'PAYMENT', resourceId, `Suppression du reçu ${before.receipt_number}`) });
         if (error) throw error;

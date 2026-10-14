@@ -15,7 +15,8 @@ import {
   Building2,
   X,
 } from 'lucide-react';
-import { api } from '../services/api.ts';
+import { api, formatDay } from '../services/api.ts';
+import { LanguageSwitcher } from '../components/LanguageSwitcher.tsx';
 import { PARCEL_STATUSES } from '../types/index.ts';
 
 interface PublicTrackingViewProps {
@@ -111,6 +112,7 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
     <div className="max-w-4xl mx-auto space-y-6 pb-12 animate-in fade-in duration-200">
       {/* Header card */}
       <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white p-6 sm:p-8 rounded-3xl shadow-2xl relative overflow-hidden text-center">
+        <div className="absolute left-4 top-4"><LanguageSwitcher /></div>
         {onClose && (
           <button
             onClick={onClose}
@@ -120,8 +122,8 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
           </button>
         )}
 
-        <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400 mb-3 shadow-lg">
-          <Package className="w-7 h-7" />
+        <div className="mx-auto mb-3 w-fit rounded-2xl bg-white px-4 py-2 shadow-lg">
+          <img src="/logo.png" alt="GZ Mubua Global" className="h-20 w-auto object-contain" />
         </div>
         <h1 className="text-2xl sm:text-3xl font-black tracking-tight text-white">
           Suivi des Marchandises en Temps Réel
@@ -209,6 +211,11 @@ export const PublicTrackingView: React.FC<PublicTrackingViewProps> = ({
                 )}
                 {trackingResult.transportMode} ➔ {trackingResult.destination}
               </div>
+              {trackingResult.estimatedArrivalDate && !['LIVRE', 'RETIRE_CLIENT'].includes(trackingResult.status) && (
+                <div className="text-xs font-bold text-emerald-700 mt-1">
+                  Arrivée estimée : {formatDay(trackingResult.estimatedArrivalDate)}
+                </div>
+              )}
             </div>
           </div>
 

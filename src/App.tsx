@@ -16,6 +16,7 @@ import type {
   SalaryPayment,
   ExchangeRates,
   AuditLogItem,
+  PaymentMethodConfig,
   NotificationItem,
   DashboardStats,
   ParcelStatus,
@@ -74,6 +75,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
     freightRateCurrency: 'USD',
   });
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
+  const [paymentMethods, setPaymentMethods] = useState<PaymentMethodConfig[]>([]);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [dashboardStats, setDashboardStats] = useState<DashboardStats | null>(null);
   // Navigation State
@@ -86,10 +88,13 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
 
   // Modals state
   const [selectedParcelForDetail, setSelectedParcelForDetail] = useState<Parcel | null>(null);
+  const [parcelDetailAction, setParcelDetailAction] = useState<'edit' | 'delete' | undefined>(undefined);
   const [selectedParcelForLabel, setSelectedParcelForLabel] = useState<Parcel | null>(null);
   const [selectedPaymentForReceipt, setSelectedPaymentForReceipt] = useState<Payment | null>(null);
   const [showNewParcelModal, setShowNewParcelModal] = useState(false);
   const [parcelSavedMessage, setParcelSavedMessage] = useState<string | null>(null);
+  // Confirmation shown after each create / update / delete (errors are shown in the form itself).
+  const [toast, setToast] = useState<string | null>(null);
   // Last registered parcel: lets the agent send its tracking number to the client right away.
   const [savedParcel, setSavedParcel] = useState<Parcel | null>(null);
   const [showNewShipmentModal, setShowNewShipmentModal] = useState(false);
@@ -123,11 +128,12 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
           isAdmin ? api.getAuditLogs() : Promise.resolve([] as AuditLogItem[]),
           api.getNotifications(),
           isClient ? Promise.resolve(null) : api.getDashboardStats(),
+          isClient ? Promise.resolve([] as PaymentMethodConfig[]) : api.getPaymentMethods().catch(() => [] as PaymentMethodConfig[]),
         ]),
         new Promise<never>((_, reject) => {
           timeoutId = setTimeout(
-            () => reject(new Error('Le serveur API ne répond pas. Vérifiez le routage Firebase vers le service API configuré.')),
-            15000
+            () => reject(new Error('Le serveur met trop de temps à répondre (connexion internet lente ou coupée). Vérifiez votre connexion puis cliquez sur « Réessayer ».')),
+            40000
           );
         }),
       ]);
@@ -146,6 +152,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
         logsData,
         notifsData,
         statsData,
+        methodsData,
       ] = loadedData;
 
       setUsers(usersData);
@@ -161,6 +168,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
       setAuditLogs(logsData);
       setNotifications(notifsData);
       setDashboardStats(statsData);
+      setPaymentMethods(methodsData);
 
     } catch (err) {
       console.error('Error loading data from backend:', err);
@@ -294,70 +302,55 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
   const handleDeleteParcel = async (id: string, withPayments = false) => {
     await api.deleteParcel(id, withPayments);
     setSelectedParcelForDetail(null);
+    setParcelDetailAction(undefined);
     await loadData();
+    setToast('Colis supprimé (trace conservée dans le journal d’audit).');
+    window.setTimeout(() => setToast(null), 5000);
   };
 
   const handleUpdateParcel = async (id: string, data: Partial<Parcel>) => {
     const updated = await api.updateParcel(id, data);
+    setParcelDetailAction(undefined);
     setSelectedParcelForDetail(updated);
     await loadData();
+    setToast('Colis mis à jour.');
+    window.setTimeout(() => setToast((c) => (c === 'Colis mis à jour.' ? null : c)), 5000);
   };
 
-  const handleDeleteClient = async (id: string) => {
-    await api.deleteClient(id);
+  // Runs a change against Supabase, reloads every list/dashboard, then confirms.
+  // Errors propagate to the calling form/dialog, which displays them.
+  const mutate = async (operation: () => Promise<unknown>, success: string) => {
+    await operation();
     await loadData();
+    setToast(success);
+    window.setTimeout(() => setToast((current) => (current === success ? null : current)), 5000);
   };
 
-  const handleUpdateClient = async (id: string, data: Partial<Client>) => {
-    await api.updateClient(id, data);
-    await loadData();
-  };
-
-  const handleDeleteShipment = async (id: string) => {
-    await api.deleteShipment(id);
-    await loadData();
-  };
-
-  const handleUpdateShipment = async (id: string, data: Partial<Shipment>) => {
-    await api.updateShipment(id, data);
-    await loadData();
-  };
-
-  const handleDeletePayment = async (id: string) => {
-    await api.deletePayment(id);
-    setSelectedPaymentForReceipt(null);
-    await loadData();
-  };
-
-  const handleDeleteExpense = async (id: string) => {
-    await api.deleteExpense(id);
-    await loadData();
-  };
-
-  const handleUpdateExpense = async (id: string, data: Partial<Expense>) => {
-    await api.updateExpense(id, data);
-    await loadData();
-  };
-
-  const handleDeleteEmployee = async (id: string) => {
-    await api.deleteEmployee(id);
-    await loadData();
-  };
-
-  const handleUpdateEmployee = async (id: string, data: Partial<Employee>) => {
-    await api.updateEmployee(id, data);
-    await loadData();
-  };
-
-  const handleDeleteSalaryPayment = async (id: string) => {
-    await api.deleteSalaryPayment(id);
-    await loadData();
-  };
-
-  const handleDeleteUser = async (id: string) => {
-    await api.deleteUser(id);
-    await loadData();
-  };
+  const handleDeleteClient = (id: string, withRecords = false) =>
+    mutate(() => api.deleteClient(id, withRecords), withRecords ? 'Client supprimé avec ses colis et paiements (trace conservée dans le journal d’audit).' : 'Client supprimé.');
+  const handleUpdateClient = (id: string, data: Partial<Client>) => mutate(() => api.updateClient(id, data), 'Fiche client mise à jour.');
+  const handleDeleteShipment = (id: string) => mutate(() => api.deleteShipment(id), 'Expédition supprimée.');
+  const handleUpdateShipment = (id: string, data: Partial<Shipment>) => mutate(() => api.updateShipment(id, data), 'Expédition mise à jour.');
+  const handleUpdatePayment = (id: string, data: Partial<Payment>) => mutate(() => api.updatePayment(id, data), 'Reçu corrigé ; soldes du colis et du client recalculés.');
+  const handleDeletePayment = (id: string) =>
+    mutate(async () => {
+      await api.deletePayment(id);
+      setSelectedPaymentForReceipt(null);
+    }, 'Reçu supprimé ; soldes recalculés (trace conservée dans le journal d’audit).');
+  const handleDeleteExpense = (id: string) => mutate(() => api.deleteExpense(id), 'Dépense supprimée (trace conservée dans le journal d’audit).');
+  const handleUpdateExpense = (id: string, data: Partial<Expense>) => mutate(() => api.updateExpense(id, data), 'Dépense corrigée.');
+  const handleDeleteEmployee = (id: string) => mutate(() => api.deleteEmployee(id), 'Employé supprimé.');
+  const handleUpdateEmployee = (id: string, data: Partial<Employee>) => mutate(() => api.updateEmployee(id, data), 'Fiche employé mise à jour.');
+  const handleUpdateSalaryPayment = (id: string, data: Partial<SalaryPayment>) =>
+    mutate(() => api.updateSalaryPayment(id, data), 'Bulletin corrigé ; la dépense de salaire liée a été mise à jour.');
+  const handleDeleteSalaryPayment = (id: string) =>
+    mutate(() => api.deleteSalaryPayment(id), 'Bulletin supprimé avec sa dépense de salaire (trace conservée dans le journal d’audit).');
+  const handleDeleteUser = (id: string) => mutate(() => api.deleteUser(id), 'Utilisateur supprimé.');
+  const handleUpdateUser = (id: string, data: Partial<User>) => mutate(() => api.updateUser(id, data), 'Utilisateur mis à jour.');
+  const handleCreatePaymentMethod = (data: Partial<PaymentMethodConfig>) => mutate(() => api.createPaymentMethod(data), 'Moyen de paiement ajouté.');
+  const handleUpdatePaymentMethod = (id: string, data: Partial<PaymentMethodConfig>) => mutate(() => api.updatePaymentMethod(id, data), 'Moyen de paiement mis à jour.');
+  const handleResetUserPassword = (id: string, password: string) =>
+    mutate(() => api.resetUserPassword(id, password), 'Mot de passe réinitialisé.');
 
   const handleUpdateRates = async (ratesData: Partial<ExchangeRates>) => {
     const updated = await api.updateExchangeRates(ratesData);
@@ -370,10 +363,8 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
     await loadData();
   };
 
-  const handleCreateUser = async (userData: Partial<User>) => {
-    await api.createUser(userData);
-    await loadData();
-  };
+  const handleCreateUser = (userData: Partial<User>) =>
+    mutate(() => api.createUser(userData), userData.password ? 'Utilisateur créé : il peut se connecter avec son mot de passe.' : 'Invitation envoyée par e-mail.');
 
   const handleMarkNotificationRead = async (id: string | 'all') => {
     try {
@@ -412,8 +403,8 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
   if (!currentUser) {
     return (
       <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center px-6 text-center text-white">
-        <div className="w-12 h-12 rounded-xl bg-amber-500 flex items-center justify-center font-black text-slate-950 text-2xl mb-4">
-          GZ
+        <div className="mb-4 rounded-xl bg-white px-3 py-2">
+          <img src="/logo.png" alt="GZ Mubua Global" className="h-20 w-auto object-contain" />
         </div>
         <div className="text-lg font-bold">GZ MUBUA GLOBAL</div>
         <p className="mt-2 max-w-md text-sm text-slate-400" role="alert">
@@ -499,6 +490,22 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               onOpenPaymentForParcel={(p) => {
                 setCurrentTab('cashier');
               }}
+              onEditParcel={
+                currentUser.role === 'admin'
+                  ? (p) => {
+                      setParcelDetailAction('edit');
+                      setSelectedParcelForDetail(p);
+                    }
+                  : undefined
+              }
+              onDeleteParcel={
+                currentUser.role === 'admin'
+                  ? (p) => {
+                      setParcelDetailAction('delete');
+                      setSelectedParcelForDetail(p);
+                    }
+                  : undefined
+              }
             />
           )}
 
@@ -541,6 +548,8 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               onDepartShipment={handleTransmitChinaToKinshasa}
               onArriveShipment={handleConfirmArrivalKinshasa}
               onSelectParcel={(p) => setSelectedParcelForDetail(p)}
+              onUpdateShipment={handleUpdateShipment}
+              onDeleteShipment={handleDeleteShipment}
             />
           )}
 
@@ -556,6 +565,11 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               userId={currentUser.id}
               onOpenReceipt={(pay) => setSelectedPaymentForReceipt(pay)}
               onCreatePayment={handleCreatePayment}
+              onUpdatePayment={handleUpdatePayment}
+              onDeletePayment={handleDeletePayment}
+              agencies={agencies}
+              paymentMethods={paymentMethods}
+              userAgencyId={currentUser.agencyId}
             />
           )}
 
@@ -567,6 +581,10 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               userName={currentUser.fullName}
               userId={currentUser.id}
               onCreateExpense={handleCreateExpense}
+              onUpdateExpense={handleUpdateExpense}
+              onDeleteExpense={handleDeleteExpense}
+              paymentMethods={paymentMethods}
+              userAgencyId={currentUser.agencyId}
             />
           )}
 
@@ -580,6 +598,10 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               userId={currentUser.id}
               onCreateSalaryPayment={handleCreateSalaryPayment}
               onCreateEmployee={handleCreateEmployee}
+              onUpdateSalaryPayment={handleUpdateSalaryPayment}
+              onDeleteSalaryPayment={handleDeleteSalaryPayment}
+              onUpdateEmployee={handleUpdateEmployee}
+              onDeleteEmployee={handleDeleteEmployee}
             />
           )}
 
@@ -593,6 +615,8 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               userId={currentUser.id}
               onCreateClient={handleCreateClient}
               onCreateActivationCode={(clientId) => api.createClientActivationCode(clientId)}
+              onUpdateClient={handleUpdateClient}
+              onDeleteClient={handleDeleteClient}
               onSelectParcel={(p) => setSelectedParcelForDetail(p)}
               onOpenPaymentForParcel={(p) => {
                 setCurrentTab('cashier');
@@ -621,6 +645,13 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
               onUpdateRates={handleUpdateRates}
               onCreateUser={handleCreateUser}
               onCreateAgency={handleCreateAgency}
+              onUpdateUser={handleUpdateUser}
+              onDeleteUser={handleDeleteUser}
+              onResetUserPassword={handleResetUserPassword}
+              currentUserId={currentUser.id}
+              paymentMethods={paymentMethods}
+              onCreatePaymentMethod={handleCreatePaymentMethod}
+              onUpdatePaymentMethod={handleUpdatePaymentMethod}
             />
           )}
         </main>
@@ -629,12 +660,17 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
       {/* Global Modals */}
       {selectedParcelForDetail && (
         <ParcelDetailModal
+          key={`${selectedParcelForDetail.id}-${parcelDetailAction || 'view'}`}
+          initialAction={parcelDetailAction}
           parcel={selectedParcelForDetail}
           userRole={currentUser.role}
           userName={currentUser.fullName}
           userId={currentUser.id}
           userAgencyName={currentUser.agencyName}
-          onClose={() => setSelectedParcelForDetail(null)}
+          onClose={() => {
+            setSelectedParcelForDetail(null);
+            setParcelDetailAction(undefined);
+          }}
           onUpdateStatus={handleUpdateParcelStatus}
           onOpenLabel={(p) => setSelectedParcelForLabel(p)}
           onOpenPaymentForParcel={(p) => {
@@ -644,6 +680,15 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
           onDeleteParcel={currentUser.role === 'admin' ? handleDeleteParcel : undefined}
           onUpdateParcel={currentUser.role === 'admin' ? handleUpdateParcel : undefined}
         />
+      )}
+
+      {toast && !parcelSavedMessage && (
+        <p
+          role="status"
+          className="fixed bottom-4 right-4 left-4 sm:left-auto z-[70] rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700 shadow-lg sm:max-w-sm"
+        >
+          ✓ {toast}
+        </p>
       )}
 
       {parcelSavedMessage && (
@@ -683,6 +728,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
           clients={clients}
           agencies={agencies}
           exchangeRates={exchangeRates}
+          paymentMethods={paymentMethods}
           onClose={() => setShowNewParcelModal(false)}
           onCreateParcel={handleCreateParcel}
           userName={currentUser.fullName}
@@ -714,6 +760,7 @@ export default function App({ authenticatedUser, onSignOut }: AppProps) {
       {selectedPaymentForReceipt && (
         <PaymentReceiptModal
           payment={selectedPaymentForReceipt}
+          paymentMethods={paymentMethods}
           onClose={() => setSelectedPaymentForReceipt(null)}
         />
       )}

@@ -8,7 +8,6 @@ import {
   DollarSign,
   TrendingDown,
   UserCheck,
-  ShieldCheck,
   Settings,
   MapPin,
   ClipboardList,
@@ -121,12 +120,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
       id: 'payroll',
       label: 'Salaires & RH',
       icon: UserCheck,
-      roles: ['admin'],
-    },
-    {
-      id: 'users',
-      label: 'Équipe & Utilisateurs',
-      icon: ShieldCheck,
       roles: ['admin'],
     },
     {

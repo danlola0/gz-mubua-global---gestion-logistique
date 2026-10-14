@@ -21,6 +21,7 @@ import {
 import type { Parcel, ParcelStatus, TransportMode, UserRole } from '../types/index.ts';
 import { PARCEL_STATUSES } from '../types/index.ts';
 import { formatUSD, formatDay, createWhatsAppTrackingLink } from '../services/api.ts';
+import { PeriodFilterBar, RowActions, usePeriodFilter } from '../components/RecordTools.tsx';
 
 interface ParcelsViewProps {
   parcels: Parcel[];
@@ -29,8 +30,10 @@ interface ParcelsViewProps {
   onSelectParcel: (parcel: Parcel) => void;
   onOpenLabel: (parcel: Parcel) => void;
   onOpenPaymentForParcel: (parcel: Parcel) => void;
-  onDeleteParcel?: (id: string, withPayments?: boolean) => Promise<void>;
   onRefresh?: () => void;
+  /** Admin row buttons: open the parcel directly on its edit form / delete confirmation. */
+  onEditParcel?: (parcel: Parcel) => void;
+  onDeleteParcel?: (parcel: Parcel) => void;
 }
 
 export const ParcelsView: React.FC<ParcelsViewProps> = ({
@@ -42,7 +45,9 @@ export const ParcelsView: React.FC<ParcelsViewProps> = ({
   onOpenPaymentForParcel,
   onDeleteParcel,
   onRefresh,
+  onEditParcel,
 }) => {
+  const period = usePeriodFilter();
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [modeFilter, setModeFilter] = useState<string>('ALL');
@@ -75,7 +80,7 @@ export const ParcelsView: React.FC<ParcelsViewProps> = ({
       const matchDest = destFilter === 'ALL' || p.destination === destFilter;
       const matchAgency = agencyFilter === 'ALL' || p.chinaAgencyId === agencyFilter;
 
-      return matchSearch && matchStatus && matchMode && matchDest && matchAgency;
+      return matchSearch && matchStatus && matchMode && matchDest && matchAgency && period.matches(p.chinaReceptionDate || p.createdAt);
     }).sort((a, b) => {
       if (sortBy === 'date_desc') return b.createdAt.localeCompare(a.createdAt);
       if (sortBy === 'date_asc') return a.createdAt.localeCompare(b.createdAt);
@@ -83,7 +88,9 @@ export const ParcelsView: React.FC<ParcelsViewProps> = ({
       if (sortBy === 'balance_desc') return b.remainingAmountUSD - a.remainingAmountUSD;
       return 0;
     });
-  }, [parcels, search, statusFilter, modeFilter, destFilter, agencyFilter, sortBy]);
+  }, [parcels, search, statusFilter, modeFilter, destFilter, agencyFilter, sortBy, period.state]);
+  const periodTotalUSD = filteredParcels.reduce((sum, p) => sum + (Number(p.totalCostUSD) || 0), 0);
+  const periodRemainingUSD = filteredParcels.reduce((sum, p) => sum + (Number(p.remainingAmountUSD) || 0), 0);
 
   // Export CSV
   const handleExportCSV = () => {
@@ -292,6 +299,16 @@ export const ParcelsView: React.FC<ParcelsViewProps> = ({
           </div>
         </div>
       </div>
+
+      <PeriodFilterBar
+        value={period.state}
+        onChange={period.setState}
+        summary={
+          <>
+            {filteredParcels.length} colis • Facturé : {formatUSD(periodTotalUSD)} • Reste : <span className="text-rose-600">{formatUSD(periodRemainingUSD)}</span>
+          </>
+        }
+      />
 
       {/* Mobile: one card per parcel */}
       <div className="md:hidden space-y-3">
@@ -522,6 +539,10 @@ export const ParcelsView: React.FC<ParcelsViewProps> = ({
                           >
                             <Share2 className="w-4 h-4" />
                           </a>
+                          <RowActions
+                            onEdit={onEditParcel ? () => onEditParcel(parcel) : undefined}
+                            onDelete={onDeleteParcel ? () => onDeleteParcel(parcel) : undefined}
+                          />
                         </div>
                       </td>
                     </tr>

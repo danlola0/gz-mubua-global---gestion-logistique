@@ -6,6 +6,8 @@ import { getSupabaseConfigError, supabaseClient } from '../services/supabaseClie
 import { SplashScreen } from './SplashScreen.tsx';
 import { PublicTrackingView } from '../views/PublicTrackingView.tsx';
 import { api } from '../services/api.ts';
+import { LanguageSwitcher } from './LanguageSwitcher.tsx';
+import { InstallAppButton } from './InstallAppButton.tsx';
 
 interface AuthGateProps {
   children: (user: User, signOut: () => Promise<void>) => React.ReactNode;
@@ -299,8 +301,9 @@ export const AuthGate: React.FC<AuthGateProps> = ({ children }) => {
         <div className="absolute -left-36 -top-36 h-96 w-96 rounded-full bg-amber-500/10 blur-3xl" />
         <div className="absolute -bottom-40 -right-24 h-[30rem] w-[30rem] rounded-full bg-cyan-500/10 blur-3xl" />
       </div>
-      <section className="w-full max-w-md rounded-3xl border border-white/10 bg-slate-900/90 p-6 shadow-2xl shadow-black/30 backdrop-blur sm:p-9">
-        <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-amber-300 to-orange-600 text-2xl font-black text-slate-950 shadow-lg shadow-amber-500/20">GZ</div>
+      <section className="relative w-full max-w-md rounded-3xl border border-white/10 bg-slate-900/90 p-6 shadow-2xl shadow-black/30 backdrop-blur sm:p-9">
+        <div className="absolute right-4 top-4 flex items-center gap-2"><InstallAppButton /><LanguageSwitcher /></div>
+        <div className="mx-auto mb-5 w-fit rounded-2xl bg-white px-4 py-2 shadow-lg shadow-amber-500/20"><img src="/logo.png" alt="GZ Mubua Global" className="h-24 w-auto object-contain" /></div>
         <p className="flex items-center justify-center gap-2 text-[10px] font-bold uppercase tracking-[0.25em] text-amber-300"><ShieldCheck className="h-3.5 w-3.5" /> Accès sécurisé</p>
         <h1 className="mt-2 text-center text-2xl font-black tracking-tight">GZ MUBUA GLOBAL</h1>
         <p className="mt-2 text-center text-sm text-slate-400">

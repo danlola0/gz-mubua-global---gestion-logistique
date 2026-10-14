@@ -11,6 +11,7 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import type { AuditLogItem } from '../types/index.ts';
+import { PeriodFilterBar, usePeriodFilter } from '../components/RecordTools.tsx';
 
 interface AuditLogsViewProps {
   logs: AuditLogItem[];
@@ -126,6 +127,7 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
   const [search, setSearch] = useState('');
   const [actionFilter, setActionFilter] = useState('ALL');
   const [entityFilter, setEntityFilter] = useState('ALL');
+  const period = usePeriodFilter();
 
   const filteredLogs = logs.filter((log) => {
     const q = search.toLowerCase();
@@ -138,7 +140,7 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
     const matchAction = actionFilter === 'ALL' || log.action === actionFilter;
     const matchEntity = entityFilter === 'ALL' || log.entityType === entityFilter;
 
-    return matchSearch && matchAction && matchEntity;
+    return matchSearch && matchAction && matchEntity && period.matches(log.timestamp);
   });
 
   const getActionBadge = (action: string) => {
@@ -242,6 +244,8 @@ export const AuditLogsView: React.FC<AuditLogsViewProps> = ({ logs }) => {
           </button>
         </div>
       </div>
+
+      <PeriodFilterBar value={period.state} onChange={period.setState} summary={<>{filteredLogs.length} événement(s) sur la période</>} />
 
       {/* Audit Log Table */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">

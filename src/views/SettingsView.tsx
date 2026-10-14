@@ -16,8 +16,9 @@ import {
   Ship,
   Plane,
 } from 'lucide-react';
-import type { ExchangeRates, Agency, User, UserRole, Currency } from '../types/index.ts';
-import { api } from '../services/api.ts';
+import type { ExchangeRates, Agency, User, UserRole, Currency, PaymentMethodConfig } from '../types/index.ts';
+import { ConfirmDeleteModal, EditRecordModal, RowActions } from '../components/RecordTools.tsx';
+import { Eye, EyeOff, KeyRound } from 'lucide-react';
 
 interface SettingsViewProps {
   exchangeRates: ExchangeRates;
@@ -26,6 +27,13 @@ interface SettingsViewProps {
   onUpdateRates: (rates: Partial<ExchangeRates>) => Promise<void>;
   onCreateUser: (userData: Partial<User>) => Promise<void>;
   onCreateAgency: (agencyData: Partial<Agency>) => Promise<void>;
+  onUpdateUser?: (id: string, data: Partial<User>) => Promise<void>;
+  onDeleteUser?: (id: string) => Promise<void>;
+  onResetUserPassword?: (id: string, password: string) => Promise<void>;
+  currentUserId?: string;
+  paymentMethods?: PaymentMethodConfig[];
+  onCreatePaymentMethod?: (data: Partial<PaymentMethodConfig>) => Promise<void>;
+  onUpdatePaymentMethod?: (id: string, data: Partial<PaymentMethodConfig>) => Promise<void>;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -35,7 +43,49 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onUpdateRates,
   onCreateUser,
   onCreateAgency,
+  onUpdateUser,
+  onDeleteUser,
+  onResetUserPassword,
+  currentUserId,
+  paymentMethods = [],
+  onCreatePaymentMethod,
+  onUpdatePaymentMethod,
 }) => {
+  // Cash box payment methods (per country).
+  const [newMethod, setNewMethod] = useState<{ country: PaymentMethodConfig['country']; label: string; kind: PaymentMethodConfig['kind'] }>({ country: 'Angola', label: '', kind: 'mobile' });
+  const [methodError, setMethodError] = useState<string | null>(null);
+  const [renamingMethod, setRenamingMethod] = useState<PaymentMethodConfig | null>(null);
+  const addMethod = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMethodError(null);
+    if (!onCreatePaymentMethod || !newMethod.label.trim()) return;
+    try {
+      await onCreatePaymentMethod(newMethod);
+      setNewMethod({ ...newMethod, label: '' });
+    } catch (err) {
+      setMethodError(err instanceof Error ? err.message : 'Ajout impossible.');
+    }
+  };
+  const toggleMethod = async (m: PaymentMethodConfig) => {
+    setMethodError(null);
+    try {
+      await onUpdatePaymentMethod?.(m.id, { active: !m.active });
+    } catch (err) {
+      setMethodError(err instanceof Error ? err.message : 'Modification impossible.');
+    }
+  };
+  const STAFF_ROLE_OPTIONS = [
+    { value: 'admin', label: 'Administrateur général' },
+    { value: 'china_team', label: 'Équipe Chine' },
+    { value: 'kinshasa_team', label: 'Équipe Kinshasa / destination' },
+    { value: 'cashier', label: 'Caissier' },
+  ];
+  const [editingUser, setEditingUser] = useState<User | null>(null);
+  const [passwordUser, setPasswordUser] = useState<User | null>(null);
+  const [deletingUser, setDeletingUser] = useState<User | null>(null);
+  // Initial password typed by the admin (optional: empty = invitation by e-mail).
+  const [initialPassword, setInitialPassword] = useState('');
+  const [showInitialPassword, setShowInitialPassword] = useState(false);
   const emptyAgency = {
     name: '',
     country: 'Chine' as Agency['country'],
@@ -79,6 +129,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     aerienPricePerKg: exchangeRates.aerienPricePerKg || 0,
     freightRateCurrency: (exchangeRates.freightRateCurrency || 'USD') as Currency,
   });
+  // Default transit delays in days ('' = not configured).
+  const [transit, setTransit] = useState<{ maritime: number | ''; aerien: number | '' }>({
+    maritime: exchangeRates.maritimeTransitDays ?? '',
+    aerien: exchangeRates.aerienTransitDays ?? '',
+  });
   const [isUpdatingRates, setIsUpdatingRates] = useState(false);
   const [rateSuccess, setRateSuccess] = useState(false);
   const [rateError, setRateError] = useState<string | null>(null);
@@ -110,6 +165,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setRateError('Les tarifs par kg doivent être des nombres positifs ou nuls.');
       return;
     }
+    if ([transit.maritime, transit.aerien].some((v) => v !== '' && (!Number.isInteger(Number(v)) || Number(v) < 0 || Number(v) > 365))) {
+      setRateError('Les délais doivent être des nombres entiers de jours (0 à 365).');
+      return;
+    }
     setIsUpdatingRates(true);
     try {
       await onUpdateRates({
@@ -120,6 +179,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         maritimePricePerCbm: Number(freight.maritimePricePerCbm),
         aerienPricePerKg: Number(freight.aerienPricePerKg),
         freightRateCurrency: freight.freightRateCurrency,
+        maritimeTransitDays: transit.maritime === '' ? null : Number(transit.maritime),
+        aerienTransitDays: transit.aerien === '' ? null : Number(transit.aerien),
       });
       setRateSuccess(true);
       setTimeout(() => setRateSuccess(false), 3000);
@@ -137,6 +198,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setUserError('Une agence compatible avec ce rôle est obligatoire.');
       return;
     }
+    if (initialPassword && initialPassword.length < 8) {
+      setUserError('Le mot de passe initial doit contenir au moins 8 caractères.');
+      return;
+    }
     setIsCreatingUser(true);
     try {
       // The agency name is taken from Supabase by the API, not from the form.
@@ -148,7 +213,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         role,
         agencyId: agencyId || undefined,
         status: 'active',
+        password: initialPassword || undefined,
       });
+      setInitialPassword('');
+      setShowInitialPassword(false);
       setShowUserModal(false);
       setUsername('');
       setFullName('');
@@ -292,6 +360,47 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <option value="CNY">CNY (¥)</option>
                   <option value="AOA">AOA (Kz)</option>
                 </select>
+              </div>
+            </div>
+
+            <div className="p-3 bg-sky-50/60 rounded-xl border border-sky-200 space-y-2">
+              <label className="block text-[11px] font-bold text-slate-700">
+                Délais d’acheminement par défaut
+              </label>
+              <p className="text-[10px] text-slate-500">
+                Proposés automatiquement à l’enregistrement d’un colis selon le mode de transport (modifiables pour chaque colis). La date d’arrivée estimée = date de réception + délai.
+              </p>
+              <div className="flex items-center gap-2">
+                <span className="w-24 text-slate-700 font-bold flex items-center gap-1">
+                  <Ship className="w-3.5 h-3.5 text-blue-600" /> Maritime
+                </span>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  max="365"
+                  placeholder="—"
+                  value={transit.maritime}
+                  onChange={(e) => setTransit({ ...transit, maritime: e.target.value === '' ? '' : Number(e.target.value) })}
+                  className="w-32 p-2 rounded-lg border border-slate-300 font-mono font-bold bg-white"
+                />
+                <span className="text-slate-700 font-bold">jours</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-24 text-slate-700 font-bold flex items-center gap-1">
+                  <Plane className="w-3.5 h-3.5 text-sky-600" /> Aérien
+                </span>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  max="365"
+                  placeholder="—"
+                  value={transit.aerien}
+                  onChange={(e) => setTransit({ ...transit, aerien: e.target.value === '' ? '' : Number(e.target.value) })}
+                  className="w-32 p-2 rounded-lg border border-slate-300 font-mono font-bold bg-white"
+                />
+                <span className="text-slate-700 font-bold">jours</span>
               </div>
             </div>
 
@@ -484,6 +593,79 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       </div>
 
+      {/* Cash box payment methods */}
+      {onCreatePaymentMethod && (
+        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-4 text-xs">
+          <div className="pb-3 border-b border-slate-100">
+            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-800 flex items-center gap-2">
+              <DollarSign className="w-4 h-4 text-emerald-600" /> Moyens de paiement des caisses
+            </h2>
+            <p className="text-[11px] text-slate-500 mt-1">
+              Utilisés pour les encaissements, les dépenses et le détail des soldes de caisse. Un moyen désactivé n’est plus proposé
+              mais reste dans l’historique (il n’est jamais supprimé).
+            </p>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {(['Chine', 'RDC', 'Angola'] as const).map((country) => (
+              <div key={country} className="p-3 rounded-xl border border-slate-200 bg-slate-50 space-y-1.5">
+                <div className="font-bold text-slate-900">Caisse {country === 'RDC' ? 'Kinshasa (RDC)' : country}</div>
+                {paymentMethods.filter((m) => m.country === country).length === 0 && (
+                  <p className="text-slate-400">Aucun moyen configuré.</p>
+                )}
+                {paymentMethods
+                  .filter((m) => m.country === country)
+                  .sort((a, b) => a.sortOrder - b.sortOrder)
+                  .map((m) => (
+                    <div key={m.id} className="flex items-center justify-between gap-2">
+                      <label className={`flex items-center gap-1.5 ${m.active ? 'text-slate-800' : 'text-slate-400 line-through'}`}>
+                        <input type="checkbox" checked={m.active} onChange={() => toggleMethod(m)} className="accent-emerald-600" title={m.active ? 'Désactiver' : 'Réactiver'} />
+                        {m.label}
+                      </label>
+                      <RowActions onEdit={onUpdatePaymentMethod ? () => setRenamingMethod(m) : undefined} editTitle="Renommer" />
+                    </div>
+                  ))}
+              </div>
+            ))}
+          </div>
+          <form onSubmit={addMethod} className="flex flex-col sm:flex-row sm:items-end gap-2 p-3 rounded-xl border border-emerald-200 bg-emerald-50/50">
+            <label className="block">
+              <span className="block font-semibold text-slate-700 mb-1">Caisse</span>
+              <select value={newMethod.country} onChange={(e) => setNewMethod({ ...newMethod, country: e.target.value as PaymentMethodConfig['country'] })} className="p-2 rounded-lg border border-slate-300 bg-white">
+                <option value="Chine">Chine</option>
+                <option value="RDC">Kinshasa (RDC)</option>
+                <option value="Angola">Angola</option>
+              </select>
+            </label>
+            <label className="block flex-1">
+              <span className="block font-semibold text-slate-700 mb-1">Nom du moyen de paiement *</span>
+              <input value={newMethod.label} onChange={(e) => setNewMethod({ ...newMethod, label: e.target.value })} required placeholder="Ex : Multicaixa Express" className="w-full p-2 rounded-lg border border-slate-300 bg-white" />
+            </label>
+            <label className="block">
+              <span className="block font-semibold text-slate-700 mb-1">Type</span>
+              <select value={newMethod.kind} onChange={(e) => setNewMethod({ ...newMethod, kind: e.target.value as PaymentMethodConfig['kind'] })} className="p-2 rounded-lg border border-slate-300 bg-white">
+                <option value="mobile">Paiement mobile</option>
+                <option value="bank">Banque</option>
+                <option value="cash">Espèces</option>
+              </select>
+            </label>
+            <button type="submit" className="px-4 py-2 font-bold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg">
+              <Plus className="inline w-3.5 h-3.5" /> Ajouter
+            </button>
+          </form>
+          {methodError && <p role="alert" className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-rose-700">{methodError}</p>}
+        </div>
+      )}
+      {renamingMethod && onUpdatePaymentMethod && (
+        <EditRecordModal
+          title={`Renommer « ${renamingMethod.label} »`}
+          note="Le nom affiché change ; les opérations déjà enregistrées restent rattachées à ce moyen."
+          initialValues={renamingMethod}
+          fields={[{ name: 'label', label: 'Nom', required: true, full: true }]}
+          onSubmit={(v) => onUpdatePaymentMethod(renamingMethod.id, { label: v.label })}
+          onClose={() => setRenamingMethod(null)}
+        />
+      )}
+
       {/* 3. Utilisateurs & Rôles (RBAC) */}
       <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-4">
         <div className="flex items-center justify-between pb-3 border-b border-slate-100">
@@ -513,6 +695,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <th className="py-2.5 px-3">Agence Attribuée</th>
                 <th className="py-2.5 px-3">Contact</th>
                 <th className="py-2.5 px-3">Statut</th>
+                <th className="py-2.5 px-3 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
@@ -530,7 +713,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     {u.phone} • {u.email}
                   </td>
                   <td className="py-2.5 px-3">
-                    <span className="text-[10px] font-bold text-emerald-600">Actif ✓</span>
+                    {u.status === 'inactive' ? (
+                      <span className="text-[10px] font-bold text-slate-400">Désactivé</span>
+                    ) : (
+                      <span className="text-[10px] font-bold text-emerald-600">Actif ✓</span>
+                    )}
+                  </td>
+                  <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                    <span className="inline-flex items-center gap-1">
+                      {onResetUserPassword && u.role !== 'client' && (
+                        <button
+                          type="button"
+                          onClick={() => setPasswordUser(u)}
+                          title="Réinitialiser le mot de passe"
+                          className="rounded-lg bg-slate-100 p-1.5 text-slate-700 transition hover:bg-amber-100 hover:text-amber-900"
+                        >
+                          <KeyRound className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <RowActions
+                        onEdit={onUpdateUser ? () => setEditingUser(u) : undefined}
+                        onDelete={onDeleteUser && u.id !== currentUserId ? () => setDeletingUser(u) : undefined}
+                      />
+                    </span>
                   </td>
                 </tr>
               ))}
@@ -587,6 +792,31 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   onChange={(e) => setEmail(e.target.value)}
                   className="w-full p-2 rounded-lg border border-slate-300"
                 />
+              </div>
+              <div>
+                <label className="block font-semibold mb-1">Mot de passe initial</label>
+                <span className="relative block">
+                  <input
+                    type={showInitialPassword ? 'text' : 'password'}
+                    minLength={8}
+                    autoComplete="new-password"
+                    placeholder="8 caractères minimum"
+                    value={initialPassword}
+                    onChange={(e) => setInitialPassword(e.target.value)}
+                    className="w-full p-2 pr-10 rounded-lg border border-slate-300"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowInitialPassword(!showInitialPassword)}
+                    className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-slate-500 hover:text-amber-600"
+                    aria-label={showInitialPassword ? 'Masquer le mot de passe' : 'Afficher le mot de passe'}
+                  >
+                    {showInitialPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </span>
+                <span className="mt-0.5 block text-[10px] text-slate-500">
+                  Avec un mot de passe, le compte est utilisable immédiatement (aucun e-mail). Laissé vide : une invitation est envoyée par e-mail.
+                </span>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
@@ -661,6 +891,70 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+      {editingUser && onUpdateUser && (
+        <EditRecordModal
+          title={`Modifier ${editingUser.fullName}`}
+          note={editingUser.role === 'client' ? 'Compte client : son rôle et son agence ne se modifient pas (il reste lié à sa fiche client).' : 'Un employé ne voit que les données de son agence. Désactiver un compte bloque immédiatement son accès.'}
+          initialValues={editingUser}
+          fields={[
+            { name: 'fullName', label: 'Nom complet', required: true },
+            { name: 'username', label: 'Identifiant', required: true },
+            { name: 'email', label: 'E-mail de connexion', type: 'email', required: true },
+            { name: 'phone', label: 'Téléphone', type: 'tel' },
+            ...(editingUser.role === 'client'
+              ? []
+              : [
+                  { name: 'role', label: 'Rôle', type: 'select' as const, required: true, options: STAFF_ROLE_OPTIONS },
+                  {
+                    name: 'agencyId',
+                    label: 'Agence',
+                    type: 'select' as const,
+                    hint: 'Équipe Chine : agence en Chine • Équipe Kinshasa : RDC/Angola • Caissier : obligatoire',
+                    options: [{ value: '', label: '— Toutes (administrateur) —' }, ...agencies.map((a) => ({ value: a.id, label: `${a.name} (${a.country})` }))],
+                  },
+                ]),
+            { name: 'status', label: 'Statut', type: 'select', options: [{ value: 'active', label: 'Actif' }, { value: 'inactive', label: 'Désactivé' }] },
+          ]}
+          onSubmit={(v) =>
+            onUpdateUser(editingUser.id, {
+              fullName: v.fullName,
+              username: v.username,
+              email: v.email,
+              phone: v.phone,
+              status: v.status as User['status'],
+              ...(editingUser.role === 'client' ? {} : { role: v.role as UserRole, agencyId: v.agencyId }),
+            })
+          }
+          onClose={() => setEditingUser(null)}
+        />
+      )}
+      {passwordUser && onResetUserPassword && (
+        <EditRecordModal
+          title={`Nouveau mot de passe — ${passwordUser.fullName}`}
+          note="Le mot de passe est transmis directement à Supabase Auth ; il n’est ni stocké ni visible dans l’application. Communiquez-le à l’utilisateur par un canal sûr."
+          initialValues={{ password: '' }}
+          submitLabel="Réinitialiser"
+          fields={[{ name: 'password', label: 'Nouveau mot de passe (8 caractères minimum)', type: 'password', required: true, full: true }]}
+          onSubmit={(v) => {
+            if (v.password.length < 8) return Promise.reject(new Error('Le mot de passe doit contenir au moins 8 caractères.'));
+            return onResetUserPassword(passwordUser.id, v.password);
+          }}
+          onClose={() => setPasswordUser(null)}
+        />
+      )}
+      {deletingUser && onDeleteUser && (
+        <ConfirmDeleteModal
+          title={`Supprimer le compte de ${deletingUser.fullName} ?`}
+          message={
+            <>
+              Le compte de connexion (<strong>{deletingUser.email}</strong>) et le profil seront supprimés : l’utilisateur ne pourra plus se connecter.
+              Les opérations qu’il a enregistrées restent dans l’historique et le journal d’audit. Pour une suspension temporaire, préférez « Modifier → Désactivé ».
+            </>
+          }
+          onConfirm={() => onDeleteUser(deletingUser.id)}
+          onClose={() => setDeletingUser(null)}
+        />
       )}
     </div>
   );

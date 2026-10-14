@@ -17,6 +17,8 @@ import {
   X,
 } from 'lucide-react';
 import type { User, ExchangeRates, NotificationItem, UserRole } from '../types/index.ts';
+import { LanguageSwitcher } from './LanguageSwitcher.tsx';
+import { InstallAppButton } from './InstallAppButton.tsx';
 
 interface HeaderProps {
   currentUser: User;
@@ -78,8 +80,8 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
-          <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-lg bg-gradient-to-br from-amber-500 to-amber-600 flex items-center justify-center font-black text-slate-950 text-lg sm:text-xl shadow-lg shadow-amber-500/20">
-            GZ
+          <div className="h-9 sm:h-10 shrink-0 rounded-lg bg-white px-1 flex items-center shadow-lg shadow-amber-500/20">
+            <img src="/logo-mark.png" alt="GZ Mubua Global" className="h-full w-auto object-contain" />
           </div>
           <div>
             <div className="flex items-center gap-2">
@@ -120,6 +122,9 @@ export const Header: React.FC<HeaderProps> = ({
               className="pl-9 pr-3 py-1.5 text-xs bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-500 w-56 lg:w-64 transition-all"
             />
           </form>
+
+          <InstallAppButton />
+          <LanguageSwitcher />
 
           <button
             onClick={onOpenPublicTracking}

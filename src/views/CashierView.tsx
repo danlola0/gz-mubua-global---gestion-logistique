@@ -15,8 +15,26 @@ import {
   Banknote,
   Smartphone,
 } from 'lucide-react';
-import type { Payment, Expense, Client, Parcel, Currency, ExchangeRates, UserRole } from '../types/index.ts';
-import { formatUSD, formatCurrency } from '../services/api.ts';
+import type { Payment, Expense, Client, Parcel, Currency, ExchangeRates, UserRole, Agency, PaymentMethodConfig } from '../types/index.ts';
+import { CASH_COUNTRIES, computeCashbox, methodLabel, normalizeMethod, unassignedPayments, type CashCountry } from '../services/cashbox.ts';
+import { CashboxModal } from '../components/CashboxModal.tsx';
+import { formatUSD, formatCurrency, formatDay } from '../services/api.ts';
+import {
+  ConfirmDeleteModal,
+  CURRENCY_OPTIONS,
+  EditRecordModal,
+  PeriodFilterBar,
+  RowActions,
+  usePeriodFilter,
+} from '../components/RecordTools.tsx';
+
+const PAYMENT_TYPE_OPTIONS = [
+  { value: 'AVANCE', label: 'Avance / acompte' },
+  { value: 'SOLDE', label: 'Solde' },
+  { value: 'FRAIS_TRANSPORT', label: 'Frais de transport' },
+  { value: 'FRAIS_SUPPLEMENTAIRES', label: 'Frais supplémentaires' },
+  { value: 'AUTRE_RECETTE', label: 'Autre recette' },
+];
 
 interface CashierViewProps {
   payments: Payment[];
@@ -29,6 +47,11 @@ interface CashierViewProps {
   userId: string;
   onOpenReceipt: (payment: Payment) => void;
   onCreatePayment: (data: any) => Promise<void>;
+  onUpdatePayment?: (id: string, data: Partial<Payment>) => Promise<void>;
+  agencies?: Agency[];
+  paymentMethods?: PaymentMethodConfig[];
+  userAgencyId?: string;
+  onDeletePayment?: (id: string) => Promise<void>;
 }
 
 export const CashierView: React.FC<CashierViewProps> = ({
@@ -42,7 +65,29 @@ export const CashierView: React.FC<CashierViewProps> = ({
   userId,
   onOpenReceipt,
   onCreatePayment,
+  onUpdatePayment,
+  onDeletePayment,
+  agencies = [],
+  paymentMethods = [],
+  userAgencyId,
 }) => {
+  // ---- Cash boxes per agency country ----
+  const userCountry = agencies.find((a) => a.id === userAgencyId)?.country as CashCountry | undefined;
+  // Admin: every cash box; other roles: only their agency's cash box (data already limited by RLS).
+  const visibleCountries = CASH_COUNTRIES.filter((c) => userRole === 'admin' || c.country === userCountry);
+  const [openCountry, setOpenCountry] = useState<CashCountry | null>(null);
+  const unassigned = unassignedPayments(payments, agencies);
+  const methodsFor = (country?: string) =>
+    paymentMethods.filter((m) => m.country === country && m.active).sort((a, b) => a.sortOrder - b.sortOrder);
+  // Agency whose cash box receives a new receipt (admin may choose, others: own agency).
+  const [cashAgencyId, setCashAgencyId] = useState(userAgencyId || agencies[0]?.id || '');
+  const cashCountry = agencies.find((a) => a.id === cashAgencyId)?.country;
+  // Corrections: cashier and admin may correct a receipt; only the admin deletes one.
+  const canEditPayment = !!onUpdatePayment && (userRole === 'admin' || userRole === 'cashier');
+  const canDeletePayment = !!onDeletePayment && userRole === 'admin';
+  const [editingPayment, setEditingPayment] = useState<Payment | null>(null);
+  const [deletingPayment, setDeletingPayment] = useState<Payment | null>(null);
+  const paymentPeriod = usePeriodFilter();
   const [activeTab, setActiveTab] = useState<'recettes' | 'depenses' | 'balances'>('recettes');
   const [search, setSearch] = useState('');
   const [currencyFilter, setCurrencyFilter] = useState<string>('ALL');
@@ -54,7 +99,7 @@ export const CashierView: React.FC<CashierViewProps> = ({
   const [paymentType, setPaymentType] = useState('AVANCE');
   const [currency, setCurrency] = useState<Currency>('USD');
   const [originalAmount, setOriginalAmount] = useState<number | ''>('');
-  const [paymentMethod, setPaymentMethod] = useState('ESPECES');
+  const [paymentMethod, setPaymentMethod] = useState('');
   const [reference, setReference] = useState('');
   const [notes, setNotes] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -94,6 +139,10 @@ export const CashierView: React.FC<CashierViewProps> = ({
       alert('Veuillez renseigner un client et un montant valide.');
       return;
     }
+    if (!methodsFor(cashCountry).some((m) => m.code === paymentMethod)) {
+      alert('Veuillez choisir le mode de paiement de la caisse de l’agence.');
+      return;
+    }
 
     setIsSubmitting(true);
     try {
@@ -109,6 +158,7 @@ export const CashierView: React.FC<CashierViewProps> = ({
         originalAmount: Number(originalAmount),
         currency,
         paymentMethod,
+        agencyId: cashAgencyId || undefined,
         reference,
         notes,
         cashierId: userId,
@@ -119,6 +169,7 @@ export const CashierView: React.FC<CashierViewProps> = ({
       setOriginalAmount('');
       setNotes('');
       setReference('');
+      setPaymentMethod('');
     } finally {
       setIsSubmitting(false);
     }
@@ -133,25 +184,14 @@ export const CashierView: React.FC<CashierViewProps> = ({
       p.clientName.toLowerCase().includes(q) ||
       (p.parcelTrackingNumber && p.parcelTrackingNumber.toLowerCase().includes(q));
     const matchCurr = currencyFilter === 'ALL' || p.currency === currencyFilter;
-    return matchSearch && matchCurr;
+    return matchSearch && matchCurr && paymentPeriod.matches(p.date);
   });
+  const periodTotalUSD = filteredPayments.reduce((sum, p) => sum + (Number(p.amountUSD) || 0), 0);
 
   // Calculate balances per currency
   const totalUSD =
     payments.filter((p) => p.currency === 'USD').reduce((s, p) => s + p.originalAmount, 0) -
     expenses.filter((e) => e.currency === 'USD').reduce((s, e) => s + e.originalAmount, 0);
-
-  const totalCNY =
-    payments.filter((p) => p.currency === 'CNY').reduce((s, p) => s + p.originalAmount, 0) -
-    expenses.filter((e) => e.currency === 'CNY').reduce((s, e) => s + e.originalAmount, 0);
-
-  const totalCDF =
-    payments.filter((p) => p.currency === 'CDF').reduce((s, p) => s + p.originalAmount, 0) -
-    expenses.filter((e) => e.currency === 'CDF').reduce((s, e) => s + e.originalAmount, 0);
-
-  const totalAOA =
-    payments.filter((p) => p.currency === 'AOA').reduce((s, p) => s + p.originalAmount, 0) -
-    expenses.filter((e) => e.currency === 'AOA').reduce((s, e) => s + e.originalAmount, 0);
 
   return (
     <div className="space-y-6 pb-12">
@@ -193,38 +233,50 @@ export const CashierView: React.FC<CashierViewProps> = ({
           <span className="text-[10px] text-slate-400">Trésorerie internationale</span>
         </div>
 
-        <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-800 shadow-sm">
-          <span className="text-[11px] font-semibold uppercase text-slate-400">
-            Solde Caisse Chine CNY (¥)
-          </span>
-          <div className="text-2xl font-black text-amber-400 mt-1">
-            {formatCurrency(totalCNY, 'CNY')}
-          </div>
-          <span className="text-[10px] text-slate-400">Guangzhou & Yiwu</span>
-        </div>
-
-        <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-800 shadow-sm">
-          <span className="text-[11px] font-semibold uppercase text-slate-400">
-            Solde Caisse Kinshasa CDF (FC)
-          </span>
-          <div className="text-2xl font-black text-sky-400 mt-1">
-            {formatCurrency(totalCDF, 'CDF')}
-          </div>
-          <span className="text-[10px] text-slate-400">Gombe & Limete</span>
-        </div>
-
-        <div className="bg-slate-900 text-white p-4 rounded-xl border border-slate-800 shadow-sm">
-          <span className="text-[11px] font-semibold uppercase text-slate-400">
-            Solde Caisse Angola AOA (Kz)
-          </span>
-          <div className="text-2xl font-black text-purple-400 mt-1">
-            {formatCurrency(totalAOA, 'AOA')}
-          </div>
-          <span className="text-[10px] text-slate-400">Luanda Viana</span>
-        </div>
+        {visibleCountries.map(({ country, label, mainCurrency }) => {
+          const box = computeCashbox(country, payments, expenses, agencies, paymentMethods);
+          const others = (Object.entries(box.totals) as [Currency, number][]).filter(([c, v]) => c !== mainCurrency && Math.abs(v) > 0.004);
+          const names = agencies.filter((a) => a.country === country).map((a) => a.name).join(' & ');
+          const color = country === 'Chine' ? 'text-amber-400' : country === 'RDC' ? 'text-sky-400' : 'text-purple-400';
+          return (
+            <button
+              key={country}
+              type="button"
+              onClick={() => setOpenCountry(country)}
+              className="text-left bg-slate-900 text-white p-4 rounded-xl border border-slate-800 shadow-sm transition hover:border-amber-500 hover:ring-2 hover:ring-amber-500/30"
+              title="Voir le détail par moyen de paiement"
+            >
+              <span className="text-[11px] font-semibold uppercase text-slate-400">Solde Caisse {label}</span>
+              <div className={`text-2xl font-black mt-1 ${color}`}>{formatCurrency(box.totals[mainCurrency] || 0, mainCurrency)}</div>
+              {others.map(([c, v]) => (
+                <div key={c} className="text-xs font-bold text-slate-200">{formatCurrency(v, c)}</div>
+              ))}
+              <span className="mt-1 flex items-center justify-between gap-2 text-[10px] text-slate-400">
+                <span className="truncate">{names || 'Aucune agence configurée'}</span>
+                <span className="shrink-0 font-bold text-amber-400">Détail ›</span>
+              </span>
+            </button>
+          );
+        })}
       </div>
 
-      {/* Tab bar */}
+      {userRole === 'admin' && unassigned.length > 0 && (
+        <p className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          {unassigned.length} encaissement(s) enregistré(s) avant l’affectation aux caisses ne sont rattachés à aucune agence
+          ({unassigned.map((p) => p.receiptNumber).join(', ')}) : ils comptent dans le solde USD global mais dans aucune caisse.
+          Corrigez-les via ✏️ dans la liste ci-dessous en choisissant l’agence.
+        </p>
+      )}
+
+      {openCountry && (
+        <CashboxModal
+          title={`Caisse ${CASH_COUNTRIES.find((c) => c.country === openCountry)?.label}`}
+          summary={computeCashbox(openCountry, payments, expenses, agencies, paymentMethods)}
+          onClose={() => setOpenCountry(null)}
+        />
+      )}
+
+      {/* Tab bar */}      {/* Tab bar */}
       <div className="flex overflow-x-auto border-b border-slate-200 bg-white rounded-xl p-1 shadow-sm gap-1">
         <button
           onClick={() => setActiveTab('recettes')}
@@ -280,6 +332,12 @@ export const CashierView: React.FC<CashierViewProps> = ({
             </div>
           </div>
 
+          <PeriodFilterBar
+            value={paymentPeriod.state}
+            onChange={paymentPeriod.setState}
+            summary={<>{filteredPayments.length} encaissement(s) • Total : <span className="text-emerald-700">{formatUSD(periodTotalUSD)}</span></>}
+          />
+
           <div className="overflow-x-auto border border-slate-200 rounded-xl">
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-900 text-white uppercase text-[10px] tracking-wider">
@@ -290,14 +348,13 @@ export const CashierView: React.FC<CashierViewProps> = ({
                   <th className="py-3 px-4">Colis Lié</th>
                   <th className="py-3 px-4">Nature & Mode</th>
                   <th className="py-3 px-4">Montant Reçu</th>
-                  <th className="py-3 px-4">Contrevaleur USD</th>
                   <th className="py-3 px-4 text-right">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredPayments.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="py-10 text-center text-slate-400">
+                    <td colSpan={7} className="py-10 text-center text-slate-400">
                       Aucune transaction trouvée.
                     </td>
                   </tr>
@@ -308,7 +365,7 @@ export const CashierView: React.FC<CashierViewProps> = ({
                         {p.receiptNumber}
                       </td>
                       <td className="py-3 px-4">
-                        <div className="font-medium text-slate-800">{p.date}</div>
+                        <div className="font-medium text-slate-800">{formatDay(p.date)}</div>
                         <div className="text-[10px] text-slate-700">{p.agencyName}</div>
                       </td>
                       <td className="py-3 px-4 font-bold text-slate-900">{p.clientName}</td>
@@ -317,21 +374,31 @@ export const CashierView: React.FC<CashierViewProps> = ({
                       </td>
                       <td className="py-3 px-4">
                         <span className="font-semibold text-slate-800">{p.type}</span>
-                        <div className="text-[10px] text-slate-700">{p.paymentMethod}</div>
+                        <div className="text-[10px] text-slate-700">
+                          {(() => {
+                            const country = agencies.find((a) => a.id === p.agencyId)?.country as CashCountry | undefined;
+                            return country ? methodLabel(normalizeMethod(p.paymentMethod), country, paymentMethods) : p.paymentMethod;
+                          })()}
+                        </div>
                       </td>
                       <td className="py-3 px-4 font-black text-slate-900">
                         {formatCurrency(p.originalAmount, p.currency)}
                       </td>
-                      <td className="py-3 px-4 font-bold text-emerald-700">
-                        {formatUSD(p.amountUSD)}
-                      </td>
                       <td className="py-3 px-4 text-right">
-                        <button
-                          onClick={() => onOpenReceipt(p)}
-                          className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition ml-auto"
-                        >
-                          <Printer className="w-3.5 h-3.5" /> Reçu
-                        </button>
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            onClick={() => onOpenReceipt(p)}
+                            className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
+                          >
+                            <Printer className="w-3.5 h-3.5" /> Reçu
+                          </button>
+                          <RowActions
+                            onEdit={canEditPayment ? () => setEditingPayment(p) : undefined}
+                            onDelete={canDeletePayment ? () => setDeletingPayment(p) : undefined}
+                            editTitle="Corriger ce reçu"
+                            deleteTitle="Supprimer ce reçu"
+                          />
+                        </div>
                       </td>
                     </tr>
                   ))
@@ -461,16 +528,66 @@ export const CashierView: React.FC<CashierViewProps> = ({
                   </label>
                   <select
                     value={paymentMethod}
+                    required
                     onChange={(e) => setPaymentMethod(e.target.value)}
                     className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
                   >
-                    <option value="ESPECES">Espèces au guichet</option>
-                    <option value="MOBILE_MONEY">Mobile Money (M-Pesa / Airtel)</option>
-                    <option value="VIREMENT">Virement bancaire</option>
-                    <option value="WECHAT_ALIPAY">WeChat Pay / Alipay (Chine)</option>
-                    <option value="CARTE">Carte bancaire (TPE)</option>
+                    <option value="">
+                      {methodsFor(cashCountry).length === 0 ? 'Aucun moyen configuré pour cette caisse' : '— Choisir le mode de paiement —'}
+                    </option>
+                    {methodsFor(cashCountry).map((m) => (
+                      <option key={m.id} value={m.code}>
+                        {m.label}
+                      </option>
+                    ))}
                   </select>
                 </div>
+                {userRole === 'admin' && (
+                  <div className="col-span-2">
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Caisse (agence d’encaissement)
+                    </label>
+                    <select
+                      value={cashAgencyId}
+                      required
+                      onChange={(e) => {
+                        setCashAgencyId(e.target.value);
+                        const country = agencies.find((a) => a.id === e.target.value)?.country;
+                        if (!methodsFor(country).some((m) => m.code === paymentMethod)) setPaymentMethod('');
+                      }}
+                      className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                    >
+                      {CASH_COUNTRIES.map(({ country, label }) => {
+                        const countryAgencies = agencies.filter((a) => a.country === country);
+                        const modes = methodsFor(country).map((m) => m.label).join(' · ') || 'aucun mode configuré';
+                        return (
+                          <optgroup key={country} label={`Caisse ${label} — ${modes}`}>
+                            {countryAgencies.length === 0 ? (
+                              <option value={`NONE-${country}`} disabled>
+                                Aucune agence {label} créée (Paramètres › Agences)
+                              </option>
+                            ) : (
+                              countryAgencies.map((a) => (
+                                <option key={a.id} value={a.id}>
+                                  {a.name} ({a.city || a.country})
+                                </option>
+                              ))
+                            )}
+                          </optgroup>
+                        );
+                      })}
+                    </select>
+                    {CASH_COUNTRIES.some(({ country }) => !agencies.some((a) => a.country === country)) && (
+                      <p className="mt-1 text-[10px] text-amber-700">
+                        Pour encaisser dans la caisse{' '}
+                        {CASH_COUNTRIES.filter(({ country }) => !agencies.some((a) => a.country === country))
+                          .map((c) => c.label)
+                          .join(' / ')}
+                        , créez d’abord l’agence dans Paramètres › Agences.
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3 bg-amber-50 p-3 rounded-xl border border-amber-200">
@@ -553,6 +670,68 @@ export const CashierView: React.FC<CashierViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+      {editingPayment && onUpdatePayment && (
+        <EditRecordModal
+          title={`Corriger le reçu ${editingPayment.receiptNumber}`}
+          note="Les soldes du colis et du client sont recalculés. L’ancienne et la nouvelle valeur sont conservées dans le journal d’audit."
+          initialValues={editingPayment}
+          fields={[
+            { name: 'originalAmount', label: 'Montant reçu', type: 'number', required: true, min: 0.01, step: '0.01' },
+            { name: 'currency', label: 'Devise', type: 'select', options: CURRENCY_OPTIONS, required: true },
+            { name: 'type', label: 'Nature', type: 'select', options: PAYMENT_TYPE_OPTIONS },
+            {
+              name: 'paymentMethod',
+              label: 'Mode de paiement',
+              type: 'select',
+              hint: userRole === 'admin' ? 'Si vous changez de caisse, choisissez un moyen disponible dans le pays de cette agence.' : undefined,
+              options: (() => {
+                const country = agencies.find((a) => a.id === editingPayment.agencyId)?.country;
+                // Receipt without agency (admin will assign one): offer every configured method.
+                const pool = country
+                  ? methodsFor(country)
+                  : paymentMethods.filter((m) => m.active && (userRole === 'admin' || m.country === userCountry));
+                const options = Array.from(new Map(pool.map((m) => [m.code, { value: m.code, label: country ? m.label : `${m.label} (${m.country})` }])).values());
+                return options.some((o) => o.value === editingPayment.paymentMethod)
+                  ? options
+                  : [{ value: editingPayment.paymentMethod, label: `${editingPayment.paymentMethod} (ancien)` }, ...options];
+              })(),
+            },
+            ...(userRole === 'admin'
+              ? [{ name: 'agencyId', label: 'Caisse (agence)', type: 'select' as const, required: true, options: [{ value: '', label: '— Choisir —' }, ...agencies.map((a) => ({ value: a.id, label: `${a.name} (${a.country})` }))] }]
+              : []),
+            { name: 'date', label: 'Date', type: 'date', required: true },
+            { name: 'reference', label: 'Référence' },
+            { name: 'notes', label: 'Notes', type: 'textarea' },
+          ]}
+          onSubmit={(v) =>
+            onUpdatePayment(editingPayment.id, {
+              originalAmount: Number(v.originalAmount),
+              currency: v.currency as Currency,
+              type: v.type as Payment['type'],
+              paymentMethod: v.paymentMethod as Payment['paymentMethod'],
+              ...(userRole === 'admin' && v.agencyId ? { agencyId: v.agencyId } : {}),
+              date: v.date,
+              reference: v.reference,
+              notes: v.notes,
+            })
+          }
+          onClose={() => setEditingPayment(null)}
+        />
+      )}
+      {deletingPayment && onDeletePayment && (
+        <ConfirmDeleteModal
+          title={`Supprimer le reçu ${deletingPayment.receiptNumber} ?`}
+          message={
+            <>
+              Montant : <strong>{formatCurrency(deletingPayment.originalAmount, deletingPayment.currency)}</strong> ({deletingPayment.clientName}).
+              Le reçu disparaîtra de la caisse et les soldes du colis et du client seront recalculés. Le détail reste
+              conservé dans le journal d’audit.
+            </>
+          }
+          onConfirm={() => onDeletePayment(deletingPayment.id)}
+          onClose={() => setDeletingPayment(null)}
+        />
       )}
     </div>
   );

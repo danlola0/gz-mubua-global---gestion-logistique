@@ -46,7 +46,8 @@ export const ParcelLabelModal: React.FC<ParcelLabelModalProps> = ({ parcel, onCl
           <div className="print-label w-full bg-white p-3 sm:p-6 border-4 border-slate-900 rounded-xl shadow-lg font-sans text-slate-900 space-y-3 sm:space-y-4">
             {/* Company branding header */}
             <div className="flex items-center justify-between gap-2 border-b-2 border-slate-900 pb-3">
-              <div className="min-w-0">
+              <img src="/logo-mark.png" alt="GZ Mubua Global" className="h-10 sm:h-12 w-auto shrink-0 object-contain" />
+              <div className="min-w-0 flex-1">
                 <h2 className="text-lg sm:text-xl font-black tracking-tight leading-none text-slate-950">
                   GZ MUBUA GLOBAL
                 </h2>

@@ -9,6 +9,7 @@ import type {
   Employee,
   SalaryPayment,
   ExchangeRates,
+  PaymentMethodConfig,
   AuditLogItem,
   NotificationItem,
   DashboardStats,
@@ -113,6 +114,30 @@ export const api = {
     return res.json();
   },
 
+  // Cash box payment methods (per country)
+  async getPaymentMethods(): Promise<PaymentMethodConfig[]> {
+    const res = await fetch(`${BASE_URL}/payment-methods`);
+    return res.json();
+  },
+
+  async createPaymentMethod(data: Partial<PaymentMethodConfig>): Promise<PaymentMethodConfig> {
+    const res = await fetch(`${BASE_URL}/payment-methods`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
+  async updatePaymentMethod(id: string, data: Partial<PaymentMethodConfig>): Promise<PaymentMethodConfig> {
+    const res = await fetch(`${BASE_URL}/payment-methods/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
   async createAgency(data: Partial<Agency>): Promise<Agency> {
     const res = await fetch(`${BASE_URL}/agencies`, {
       method: 'POST',
@@ -187,8 +212,8 @@ export const api = {
     return res.json();
   },
 
-  async deleteClient(id: string): Promise<{ success: boolean; message: string }> {
-    const res = await fetch(`${BASE_URL}/clients/${id}`, { method: 'DELETE' });
+  async deleteClient(id: string, withRecords = false): Promise<{ success: boolean; message: string }> {
+    const res = await fetch(`${BASE_URL}/clients/${id}${withRecords ? '?withRecords=true' : ''}`, { method: 'DELETE' });
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.error || 'Erreur lors de la suppression');
@@ -363,6 +388,16 @@ export const api = {
     return res.json();
   },
 
+  /** Corrects a receipt (amount, currency, method, date…); balances are recalculated server-side. */
+  async updatePayment(id: string, data: Partial<Payment>): Promise<Payment> {
+    const res = await fetch(`${BASE_URL}/payments/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
   async deletePayment(id: string): Promise<{ success: boolean; message: string }> {
     const res = await fetch(`${BASE_URL}/payments/${id}`, { method: 'DELETE' });
     if (!res.ok) {
@@ -452,6 +487,16 @@ export const api = {
     return res.json();
   },
 
+  /** Corrects a pay slip; its salary expense is kept in sync server-side. */
+  async updateSalaryPayment(id: string, data: Partial<SalaryPayment>): Promise<SalaryPayment> {
+    const res = await fetch(`${BASE_URL}/salaries/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    return res.json();
+  },
+
   async deleteSalaryPayment(id: string): Promise<{ success: boolean; message: string }> {
     const res = await fetch(`${BASE_URL}/salaries/${id}`, { method: 'DELETE' });
     if (!res.ok) {
@@ -462,6 +507,16 @@ export const api = {
   },
 
   // User management
+  /** Admin sets a new password; it goes straight to Supabase Auth (never stored by the app). */
+  async resetUserPassword(id: string, password: string): Promise<{ success: boolean; message: string }> {
+    const res = await fetch(`${BASE_URL}/users/${id}/password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    return res.json();
+  },
+
   async updateUser(id: string, data: Partial<User>): Promise<User> {
     const res = await fetch(`${BASE_URL}/users/${id}`, {
       method: 'PUT',

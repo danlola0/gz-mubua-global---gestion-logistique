@@ -15,8 +15,8 @@ import {
   CheckCircle2,
   AlertCircle,
 } from 'lucide-react';
-import type { Client, TransportMode, Currency, Agency, ExchangeRates } from '../types/index.ts';
-import { api, formatCurrency } from '../services/api.ts';
+import type { Client, TransportMode, Currency, Agency, ExchangeRates, PaymentMethodConfig } from '../types/index.ts';
+import { api, formatCurrency, formatDay } from '../services/api.ts';
 import { compressImageFile } from '../services/imageUpload.ts';
 import { basisForMode, computeParcelPricing, currencyRate, volumeFromDimensionsCm } from '../../supabase/functions/_shared/parcelPricing.ts';
 
@@ -24,6 +24,7 @@ interface NewParcelModalProps {
   clients: Client[];
   agencies: Agency[];
   exchangeRates: ExchangeRates;
+  paymentMethods?: PaymentMethodConfig[];
   onClose: () => void;
   onCreateParcel: (data: any) => Promise<void>;
   userName: string;
@@ -36,6 +37,7 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
   clients,
   agencies,
   exchangeRates,
+  paymentMethods = [],
   onClose,
   onCreateParcel,
   userName,
@@ -52,6 +54,10 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
   // Reception date of the parcel (defaults to today, local time; can be set to a past day).
   const todayLocal = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 10);
   const [receptionDate, setReceptionDate] = useState(todayLocal);
+  // Transit delay (days): default of the transport mode, editable per parcel.
+  const defaultTransitDays = (mode: string) =>
+    (mode === 'AERIEN' ? exchangeRates.aerienTransitDays : exchangeRates.maritimeTransitDays) ?? '';
+  const [transitDays, setTransitDays] = useState<number | ''>('');
   const [quantity, setQuantity] = useState(1);
   const [weightKg, setWeightKg] = useState<number | ''>('');
   const [lengthCm, setLengthCm] = useState<number | ''>('');
@@ -74,9 +80,9 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
   const [purchaseInfo, setPurchaseInfo] = useState('');
   // Amounts below are expressed in the tariff currency (pricingCurrency).
   const [transportCost, setTransportCost] = useState<number | ''>('');
-  const [extraFees, setExtraFees] = useState<number | ''>(0);
+  const [extraFees] = useState<number | ''>(0); // field removed from the form: always 0
   const [amountPaid, setAmountPaid] = useState<number | ''>(0);
-  const [paymentMethod, setPaymentMethod] = useState('ESPECES');
+  const [paymentMethod, setPaymentMethod] = useState('');
   const MAX_PHOTOS = 10;
   const [photos, setPhotos] = useState<string[]>([]);
   const [uploadingCount, setUploadingCount] = useState(0);
@@ -90,6 +96,16 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
   // tariffs come from the admin settings. 0 means manual pricing.
   const pricingCurrency: Currency = exchangeRates.freightRateCurrency || 'USD';
   const basis = basisForMode(transportMode);
+  // The delay proposed follows the transport mode (default set in Settings).
+  useEffect(() => {
+    setTransitDays(defaultTransitDays(transportMode));
+  }, [transportMode, exchangeRates.aerienTransitDays, exchangeRates.maritimeTransitDays]);
+  const estimatedArrival = (() => {
+    if (transitDays === '' || !Number.isInteger(Number(transitDays)) || Number(transitDays) < 0 || !/^\d{4}-\d{2}-\d{2}$/.test(receptionDate)) return null;
+    const d = new Date(`${receptionDate}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + Number(transitDays));
+    return d.toISOString().slice(0, 10);
+  })();
   const unitPrice = (basis === 'KG' ? exchangeRates.aerienPricePerKg : exchangeRates.maritimePricePerCbm) || 0;
   const hasTariff = unitPrice > 0;
   const volumeCbm = volumeFromDimensionsCm(lengthCm, widthCm, heightCm);
@@ -110,6 +126,12 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
     [basis, weightKg, volumeCbm, unitPrice, transportCost, extraFees, amountPaid, pricingCurrency, exchangeRates]
   );
   const money = (amount: number) => formatCurrency(amount, pricingCurrency);
+  // The down payment goes to the cash box of the parcel's China agency (else the agent's agency).
+  const downPaymentAgency = agencies.find((a) => a.id === (chinaAgencyId || userAgencyId));
+  const downPaymentCountry = downPaymentAgency?.country;
+  const downPaymentMethods = paymentMethods
+    .filter((m) => m.country === downPaymentCountry && m.active)
+    .sort((a, b) => a.sortOrder - b.sortOrder);
 
   // When client changes from dropdown
   const handleClientSelect = (id: string) => {
@@ -168,6 +190,10 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
       setSubmitError('Indiquez une date de réception valide (pas dans le futur).');
       return;
     }
+    if (Number(amountPaid) > 0 && !downPaymentMethods.some((m) => m.code === paymentMethod)) {
+      setSubmitError('Choisissez le mode de paiement de l’acompte (« Reçu par »).');
+      return;
+    }
     if (!pricing.ok) {
       setSubmitError(pricing.error);
       return;
@@ -183,6 +209,7 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
         senderClientId: senderClientId || null,
         description,
         chinaReceptionDate: receptionDate,
+        estimatedTransitDays: transitDays === '' ? null : Number(transitDays),
         quantity: Number(quantity) || 1,
         // Air: weight only. Sea: dimensions (cm) -> volume (CBM), weight not required.
         weightKg: basis === 'KG' ? Number(weightKg) : 0,
@@ -387,6 +414,32 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
                 </div>
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Délai d’acheminement ({transportMode === 'AERIEN' ? 'aérien' : 'maritime'}, jours)
+                  </label>
+                  <input
+                    type="number"
+                    step="1"
+                    min="0"
+                    max="365"
+                    placeholder="Ex: 45"
+                    value={transitDays}
+                    onChange={(e) => setTransitDays(e.target.value === '' ? '' : Number(e.target.value))}
+                    className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                  />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                    Arrivée estimée à destination
+                  </label>
+                  <div className="w-full text-xs p-2 rounded-lg border border-slate-200 bg-slate-100 font-bold text-slate-800">
+                    {estimatedArrival ? formatDay(estimatedArrival) : '— (saisissez le délai)'}
+                  </div>
+                </div>
+              </div>
+
               {transportMode === 'AERIEN' ? (
                 <div className="grid grid-cols-2 gap-3">
                   <div>
@@ -539,32 +592,6 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                  Fournisseur / Vendeur chinois
-                </label>
-                <input
-                  type="text"
-                  placeholder="Ex: Guangzhou Jinlong Textile Co., Ltd."
-                  value={supplier}
-                  onChange={(e) => setSupplier(e.target.value)}
-                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
-                />
-              </div>
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                  Référence d’achat / Facture
-                </label>
-                <input
-                  type="text"
-                  placeholder="Ex: Facture 16,800 RMB ou Bon n° JL-884"
-                  value={purchaseInfo}
-                  onChange={(e) => setPurchaseInfo(e.target.value)}
-                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
-                />
-              </div>
-            </div>
           </div>
 
           {/* 4. Pricing & Initial Payment */}
@@ -609,23 +636,6 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
 
               <div>
                 <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                  Frais annexes (douane/manutention) ({pricingCurrency})
-                </label>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0"
-                  placeholder="0"
-                  value={extraFees}
-                  onChange={(e) =>
-                    setExtraFees(e.target.value === '' ? '' : Number(e.target.value))
-                  }
-                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
-                />
-              </div>
-
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
                   Acompte versé à l’enregistrement ({pricingCurrency})
                 </label>
                 <input
@@ -639,6 +649,31 @@ export const NewParcelModal: React.FC<NewParcelModalProps> = ({
                   }
                   className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-emerald-50 text-emerald-900 font-bold"
                 />
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                  Mode de paiement de l’acompte{Number(amountPaid) > 0 ? ' *' : ''}
+                </label>
+                <select
+                  value={paymentMethod}
+                  onChange={(e) => setPaymentMethod(e.target.value)}
+                  required={Number(amountPaid) > 0}
+                  className="w-full text-xs p-2 rounded-lg border border-slate-300 bg-white"
+                  title="Moyen de paiement de l’acompte (caisse de l’agence Chine du colis, sinon de votre agence)"
+                >
+                  <option value="">
+                    {downPaymentMethods.length === 0 ? 'Aucun moyen configuré pour cette caisse' : '— Choisir le mode de paiement —'}
+                  </option>
+                  {downPaymentMethods.map((m) => (
+                    <option key={m.id} value={m.code}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-0.5 text-[10px] text-slate-500">
+                  Caisse {downPaymentAgency?.name || '—'}{Number(amountPaid) > 0 ? '' : ' · obligatoire si un acompte est versé'}
+                </p>
               </div>
             </div>
 

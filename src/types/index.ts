@@ -9,6 +9,8 @@ export interface FreightRates {
   maritimePricePerCbm: number; // Prix maritime par CBM (m³)
   aerienPricePerKg: number;
   freightRateCurrency: Currency;
+  aerienTransitDays?: number | null; // délai d’acheminement par défaut (jours)
+  maritimeTransitDays?: number | null;
 }
 
 export type ParcelStatus =
@@ -255,6 +257,8 @@ export interface Parcel {
   purchaseInfo?: string;
   chinaReceptionAddress: string;
   chinaReceptionDate?: string;
+  estimatedTransitDays?: number | null; // délai d’acheminement (jours)
+  estimatedArrivalDate?: string | null; // date de réception + délai
   chinaAgencyId: string;
   chinaAgencyName: string;
   shipmentId?: string;
@@ -332,7 +336,9 @@ export interface Payment {
   currency: Currency;
   exchangeRate: number; // Taux vers USD (ex: 1 USD = 2850 CDF)
   amountUSD: number;
-  paymentMethod: 'ESPECES' | 'MOBILE_MONEY' | 'VIREMENT' | 'WECHAT_ALIPAY' | 'CARTE';
+  // Code of a payment method configured for the agency's country (table payment_methods).
+  // Older receipts may hold the former generic codes (MOBILE_MONEY, VIREMENT, WECHAT_ALIPAY, CARTE).
+  paymentMethod: string;
   reference?: string;
   date: string;
   time: string;
@@ -378,6 +384,7 @@ export interface Expense {
   time: string;
   recordedBy: string;
   description: string;
+  paymentMethod?: string | null; // Moyen de paiement de la caisse (null = enregistrée avant)
   attachmentName?: string;
   attachmentUrl?: string;
 }
@@ -428,6 +435,17 @@ export interface ExchangeRates extends Partial<FreightRates> {
   CDF: number; // ex: 2850
   AOA: number; // ex: 920
   lastUpdated: string;
+}
+
+/** Payment method of a cash box (per country), configurable by the admin. */
+export interface PaymentMethodConfig {
+  id: string;
+  country: 'Chine' | 'RDC' | 'Angola';
+  code: string;
+  label: string;
+  kind: 'cash' | 'bank' | 'mobile';
+  active: boolean;
+  sortOrder: number;
 }
 
 export interface AuditLogItem {

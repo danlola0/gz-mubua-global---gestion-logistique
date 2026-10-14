@@ -13,7 +13,8 @@ import {
   Filter,
 } from 'lucide-react';
 import type { Shipment, Parcel, UserRole } from '../types/index.ts';
-import { formatUSD } from '../services/api.ts';
+import { formatUSD, formatDay } from '../services/api.ts';
+import { ConfirmDeleteModal, EditRecordModal, PeriodFilterBar, RowActions, usePeriodFilter } from '../components/RecordTools.tsx';
 
 interface ShipmentsViewProps {
   shipments: Shipment[];
@@ -23,6 +24,8 @@ interface ShipmentsViewProps {
   onDepartShipment: (shipmentId: string) => Promise<void>;
   onArriveShipment: (shipmentId: string) => Promise<void>;
   onSelectParcel: (parcel: Parcel) => void;
+  onUpdateShipment?: (id: string, data: Partial<Shipment>) => Promise<void>;
+  onDeleteShipment?: (id: string) => Promise<void>;
 }
 
 export const ShipmentsView: React.FC<ShipmentsViewProps> = ({
@@ -33,7 +36,15 @@ export const ShipmentsView: React.FC<ShipmentsViewProps> = ({
   onDepartShipment,
   onArriveShipment,
   onSelectParcel,
+  onUpdateShipment,
+  onDeleteShipment,
 }) => {
+  // Admin and China team edit shipment details (API checks the agency); only the admin deletes.
+  const canEdit = !!onUpdateShipment && (userRole === 'admin' || userRole === 'china_team');
+  const canDelete = !!onDeleteShipment && userRole === 'admin';
+  const [editingShipment, setEditingShipment] = useState<Shipment | null>(null);
+  const [deletingShipment, setDeletingShipment] = useState<Shipment | null>(null);
+  const period = usePeriodFilter();
   const [filterMode, setFilterMode] = useState<string>('ALL');
   const [filterStatus, setFilterStatus] = useState<string>('ALL');
   const [selectedShipment, setSelectedShipment] = useState<Shipment | null>(shipments[0] || null);
@@ -42,7 +53,7 @@ export const ShipmentsView: React.FC<ShipmentsViewProps> = ({
   const filteredShipments = shipments.filter((s) => {
     const matchMode = filterMode === 'ALL' || s.transportMode === filterMode;
     const matchStatus = filterStatus === 'ALL' || s.status === filterStatus;
-    return matchMode && matchStatus;
+    return matchMode && matchStatus && period.matches(s.departureDate || s.createdAt);
   });
 
   // Parcels inside the selected shipment
@@ -122,6 +133,12 @@ export const ShipmentsView: React.FC<ShipmentsViewProps> = ({
       </div>
 
       {/* Grid: Left Shipments list, Right Manifest detail */}
+      <PeriodFilterBar
+        value={period.state}
+        onChange={period.setState}
+        summary={<>{filteredShipments.length} expédition(s) • {filteredShipments.reduce((n, sh) => n + (Number(sh.parcelCount) || 0), 0)} colis</>}
+      />
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Left: Shipments List */}
         <div className="space-y-3">
@@ -194,6 +211,10 @@ export const ShipmentsView: React.FC<ShipmentsViewProps> = ({
                     <span className="text-xs font-bold bg-slate-100 px-2.5 py-0.5 rounded text-slate-700">
                       Statut : {selectedShipment.status}
                     </span>
+                    <RowActions
+                      onEdit={canEdit ? () => setEditingShipment(selectedShipment) : undefined}
+                      onDelete={canDelete ? () => setDeletingShipment(selectedShipment) : undefined}
+                    />
                   </div>
                   <p className="text-xs text-slate-700 mt-1">
                     Transporteur : <strong>{selectedShipment.carrierName}</strong> | Conteneur/Vol :{' '}
@@ -317,6 +338,40 @@ export const ShipmentsView: React.FC<ShipmentsViewProps> = ({
           )}
         </div>
       </div>
+      {editingShipment && onUpdateShipment && (
+        <EditRecordModal
+          title={`Modifier l’expédition ${editingShipment.shipmentNumber}`}
+          initialValues={editingShipment}
+          fields={[
+            { name: 'carrierName', label: 'Transporteur' },
+            { name: 'containerOrFlightNumber', label: 'N° conteneur / vol' },
+            { name: 'departureDate', label: 'Date de départ', type: 'date' },
+            { name: 'estimatedArrivalDate', label: 'Arrivée estimée', type: 'date' },
+            { name: 'comments', label: 'Commentaires', type: 'textarea' },
+          ]}
+          onSubmit={(v) =>
+            onUpdateShipment(editingShipment.id, {
+              carrierName: v.carrierName,
+              containerOrFlightNumber: v.containerOrFlightNumber,
+              departureDate: v.departureDate || undefined,
+              estimatedArrivalDate: v.estimatedArrivalDate || undefined,
+              comments: v.comments,
+            })
+          }
+          onClose={() => setEditingShipment(null)}
+        />
+      )}
+      {deletingShipment && onDeleteShipment && (
+        <ConfirmDeleteModal
+          title={`Supprimer l’expédition ${deletingShipment.shipmentNumber} ?`}
+          message="Les colis rattachés ne sont pas supprimés : ils sont simplement détachés de cette expédition. La suppression est tracée dans le journal d’audit."
+          onConfirm={async () => {
+            await onDeleteShipment(deletingShipment.id);
+            setSelectedShipment(null);
+          }}
+          onClose={() => setDeletingShipment(null)}
+        />
+      )}
     </div>
   );
 };

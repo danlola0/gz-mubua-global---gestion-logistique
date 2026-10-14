@@ -11,7 +11,15 @@ import {
   FileText,
 } from 'lucide-react';
 import type { Employee, SalaryPayment, Currency, Agency, UserRole } from '../types/index.ts';
-import { formatUSD, formatCurrency } from '../services/api.ts';
+import { formatUSD, formatCurrency, formatDay } from '../services/api.ts';
+import {
+  ConfirmDeleteModal,
+  CURRENCY_OPTIONS,
+  EditRecordModal,
+  PeriodFilterBar,
+  RowActions,
+  usePeriodFilter,
+} from '../components/RecordTools.tsx';
 
 interface PayrollViewProps {
   employees: Employee[];
@@ -22,6 +30,10 @@ interface PayrollViewProps {
   userId: string;
   onCreateSalaryPayment: (data: any) => Promise<void>;
   onCreateEmployee: (data: any) => Promise<void>;
+  onUpdateSalaryPayment?: (id: string, data: Partial<SalaryPayment>) => Promise<void>;
+  onDeleteSalaryPayment?: (id: string) => Promise<void>;
+  onUpdateEmployee?: (id: string, data: Partial<Employee>) => Promise<void>;
+  onDeleteEmployee?: (id: string) => Promise<void>;
 }
 
 export const PayrollView: React.FC<PayrollViewProps> = ({
@@ -33,7 +45,20 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
   userId,
   onCreateSalaryPayment,
   onCreateEmployee,
+  onUpdateSalaryPayment,
+  onDeleteSalaryPayment,
+  onUpdateEmployee,
+  onDeleteEmployee,
 }) => {
+  // Payroll is reserved to the admin (also enforced by the API and RLS).
+  const isAdmin = userRole === 'admin';
+  const [editingSlip, setEditingSlip] = useState<SalaryPayment | null>(null);
+  const [deletingSlip, setDeletingSlip] = useState<SalaryPayment | null>(null);
+  const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
+  const [deletingEmployee, setDeletingEmployee] = useState<Employee | null>(null);
+  const slipPeriod = usePeriodFilter();
+  const visibleSlips = salaryPayments.filter((slip) => slipPeriod.matches(slip.paymentDate));
+  const slipsTotalUSD = visibleSlips.reduce((sum, slip) => sum + (Number(slip.netSalaryUSD) || 0), 0);
   const [activeTab, setActiveTab] = useState<'slips' | 'employees'>('slips');
   const [showPayModal, setShowPayModal] = useState(false);
   const [showEmpModal, setShowEmpModal] = useState(false);
@@ -41,8 +66,8 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
 
   // Pay Slip Form
   const [selectedEmpId, setSelectedEmpId] = useState(employees[0]?.id || '');
-  const [periodMonth, setPeriodMonth] = useState('2026-10');
-  const [baseSalaryUSD, setBaseSalaryUSD] = useState<number | ''>(employees[0]?.baseSalaryUSD || 1000);
+  const [periodMonth, setPeriodMonth] = useState(() => new Date().toISOString().slice(0, 7));
+  const [baseSalaryUSD, setBaseSalaryUSD] = useState<number | ''>(employees[0]?.baseSalaryUSD || '');
   const [primesUSD, setPrimesUSD] = useState<number | ''>(0);
   const [avancesUSD, setAvancesUSD] = useState<number | ''>(0);
   const [retenuesUSD, setRetenuesUSD] = useState<number | ''>(0);
@@ -232,6 +257,13 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
 
       {/* Slips table */}
       {activeTab === 'slips' && (
+        <PeriodFilterBar
+          value={slipPeriod.state}
+          onChange={slipPeriod.setState}
+          summary={<>{visibleSlips.length} bulletin(s) • Net total : <span className="text-slate-900">{formatUSD(slipsTotalUSD)}</span></>}
+        />
+      )}
+      {activeTab === 'slips' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
@@ -248,12 +280,22 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {salaryPayments.map((slip) => (
+                {visibleSlips.length === 0 && (
+                  <tr>
+                    <td colSpan={8} className="py-10 text-center text-slate-400">
+                      Aucun bulletin sur cette période.
+                    </td>
+                  </tr>
+                )}
+                {visibleSlips.map((slip) => (
                   <tr key={slip.id} className="hover:bg-slate-50 transition">
                     <td className="py-3 px-4 font-mono font-bold text-slate-900">
                       {slip.slipNumber}
                     </td>
-                    <td className="py-3 px-4 font-semibold">{slip.periodMonth}</td>
+                    <td className="py-3 px-4 font-semibold">
+                      {slip.periodMonth}
+                      <div className="text-[10px] font-normal text-slate-500">Payé le {formatDay(slip.paymentDate)}</div>
+                    </td>
                     <td className="py-3 px-4 font-bold text-slate-900">{slip.employeeName}</td>
                     <td className="py-3 px-4">
                       <div>{slip.jobTitle}</div>
@@ -273,12 +315,20 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                       </span>
                     </td>
                     <td className="py-3 px-4 text-right">
-                      <button
-                        onClick={() => setSelectedSlip(slip)}
-                        className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition ml-auto"
-                      >
-                        <Printer className="w-3.5 h-3.5" /> Imprimer Fiche
-                      </button>
+                      <div className="flex items-center justify-end gap-1">
+                        <button
+                          onClick={() => setSelectedSlip(slip)}
+                          className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition"
+                        >
+                          <Printer className="w-3.5 h-3.5" /> Imprimer Fiche
+                        </button>
+                        <RowActions
+                          onEdit={isAdmin && onUpdateSalaryPayment ? () => setEditingSlip(slip) : undefined}
+                          onDelete={isAdmin && onDeleteSalaryPayment ? () => setDeletingSlip(slip) : undefined}
+                          editTitle="Corriger ce bulletin"
+                          deleteTitle="Supprimer ce bulletin"
+                        />
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -301,8 +351,14 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                   <h3 className="font-black text-slate-900 text-base">{emp.fullName}</h3>
                   <p className="text-xs text-amber-700 font-bold">{emp.jobTitle}</p>
                 </div>
-                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800">
-                  {emp.status}
+                <span className="flex items-center gap-1">
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800">
+                    {emp.status}
+                  </span>
+                  <RowActions
+                    onEdit={isAdmin && onUpdateEmployee ? () => setEditingEmployee(emp) : undefined}
+                    onDelete={isAdmin && onDeleteEmployee ? () => setDeletingEmployee(emp) : undefined}
+                  />
                 </span>
               </div>
 
@@ -356,6 +412,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
             <div className="p-6 bg-slate-50 flex items-center justify-center">
               <div className="w-full bg-white p-6 border border-slate-300 rounded-xl shadow space-y-4 text-xs font-sans">
                 <div className="text-center border-b pb-3">
+                  <img src="/logo.png" alt="GZ Mubua Global" className="mx-auto mb-2 h-16 w-auto object-contain" />
                   <h2 className="text-lg font-black text-slate-950">GZ MUBUA GLOBAL</h2>
                   <p className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">
                     BULLETIN OFFICIEL DE PAIE • {selectedSlip.periodMonth}
@@ -647,6 +704,86 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+      {editingSlip && onUpdateSalaryPayment && (
+        <EditRecordModal
+          title={`Corriger le bulletin ${editingSlip.slipNumber}`}
+          note="Le salaire net est recalculé (base + primes + heures sup. − avances − retenues) et la dépense de salaire liée est mise à jour. L’ancienne et la nouvelle valeur sont conservées dans le journal d’audit."
+          initialValues={editingSlip}
+          fields={[
+            { name: 'baseSalaryUSD', label: 'Salaire de base (USD)', type: 'number', required: true, min: 0, step: '0.01' },
+            { name: 'primesUSD', label: 'Primes (USD)', type: 'number', min: 0, step: '0.01' },
+            { name: 'overtimeUSD', label: 'Heures supplémentaires (USD)', type: 'number', min: 0, step: '0.01' },
+            { name: 'avancesUSD', label: 'Avances déduites (USD)', type: 'number', min: 0, step: '0.01' },
+            { name: 'retenuesUSD', label: 'Retenues (USD)', type: 'number', min: 0, step: '0.01' },
+            { name: 'currency', label: 'Devise de versement', type: 'select', options: CURRENCY_OPTIONS },
+            { name: 'paymentDate', label: 'Date de paiement', type: 'date', required: true },
+            { name: 'paymentMethod', label: 'Mode de paiement' },
+            { name: 'notes', label: 'Notes', type: 'textarea' },
+          ]}
+          onSubmit={(v) =>
+            onUpdateSalaryPayment(editingSlip.id, {
+              baseSalaryUSD: Number(v.baseSalaryUSD),
+              primesUSD: Number(v.primesUSD) || 0,
+              overtimeUSD: Number(v.overtimeUSD) || 0,
+              avancesUSD: Number(v.avancesUSD) || 0,
+              retenuesUSD: Number(v.retenuesUSD) || 0,
+              currency: v.currency as Currency,
+              paymentDate: v.paymentDate,
+              paymentMethod: v.paymentMethod,
+              notes: v.notes,
+            })
+          }
+          onClose={() => setEditingSlip(null)}
+        />
+      )}
+      {deletingSlip && onDeleteSalaryPayment && (
+        <ConfirmDeleteModal
+          title={`Supprimer le bulletin ${deletingSlip.slipNumber} ?`}
+          message={
+            <>
+              {deletingSlip.employeeName} — net <strong>{formatUSD(deletingSlip.netSalaryUSD)}</strong> ({deletingSlip.periodMonth}).
+              La dépense de salaire liée sera aussi supprimée ; le détail reste conservé dans le journal d’audit.
+            </>
+          }
+          onConfirm={() => onDeleteSalaryPayment(deletingSlip.id)}
+          onClose={() => setDeletingSlip(null)}
+        />
+      )}
+      {editingEmployee && onUpdateEmployee && (
+        <EditRecordModal
+          title={`Modifier ${editingEmployee.fullName}`}
+          initialValues={editingEmployee}
+          fields={[
+            { name: 'fullName', label: 'Nom complet', required: true },
+            { name: 'phone', label: 'Téléphone', type: 'tel' },
+            { name: 'jobTitle', label: 'Fonction' },
+            { name: 'agencyId', label: 'Agence', type: 'select', options: [{ value: '', label: '— Aucune —' }, ...agencies.map((a) => ({ value: a.id, label: `${a.name} (${a.country})` }))] },
+            { name: 'baseSalaryUSD', label: 'Salaire de base (USD)', type: 'number', required: true, min: 0.01, step: '0.01' },
+            { name: 'preferredCurrency', label: 'Devise préférée', type: 'select', options: CURRENCY_OPTIONS },
+            { name: 'status', label: 'Statut', type: 'select', options: [{ value: 'actif', label: 'Actif' }, { value: 'inactif', label: 'Inactif' }] },
+          ]}
+          onSubmit={(v) =>
+            onUpdateEmployee(editingEmployee.id, {
+              fullName: v.fullName,
+              phone: v.phone,
+              jobTitle: v.jobTitle,
+              agencyId: v.agencyId,
+              baseSalaryUSD: Number(v.baseSalaryUSD),
+              preferredCurrency: v.preferredCurrency as Currency,
+              status: v.status as Employee['status'],
+            })
+          }
+          onClose={() => setEditingEmployee(null)}
+        />
+      )}
+      {deletingEmployee && onDeleteEmployee && (
+        <ConfirmDeleteModal
+          title={`Supprimer ${deletingEmployee.fullName} ?`}
+          message="La fiche employé sera supprimée. Si l’employé possède déjà des bulletins de paie, la suppression est refusée pour préserver l’historique : passez plutôt son statut à « Inactif »."
+          onConfirm={() => onDeleteEmployee(deletingEmployee.id)}
+          onClose={() => setDeletingEmployee(null)}
+        />
       )}
     </div>
   );

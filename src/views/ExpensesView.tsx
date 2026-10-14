@@ -10,8 +10,17 @@ import {
   FileText,
   Tag,
 } from 'lucide-react';
-import type { Expense, ExpenseCategory, Currency, Agency, UserRole } from '../types/index.ts';
-import { formatUSD, formatCurrency } from '../services/api.ts';
+import type { Expense, ExpenseCategory, Currency, Agency, UserRole, PaymentMethodConfig } from '../types/index.ts';
+import { methodLabel, normalizeMethod, type CashCountry } from '../services/cashbox.ts';
+import { formatUSD, formatCurrency, formatDay } from '../services/api.ts';
+import {
+  ConfirmDeleteModal,
+  CURRENCY_OPTIONS,
+  EditRecordModal,
+  PeriodFilterBar,
+  RowActions,
+  usePeriodFilter,
+} from '../components/RecordTools.tsx';
 
 interface ExpensesViewProps {
   expenses: Expense[];
@@ -20,6 +29,10 @@ interface ExpensesViewProps {
   userName: string;
   userId: string;
   onCreateExpense: (data: any) => Promise<void>;
+  onUpdateExpense?: (id: string, data: Partial<Expense>) => Promise<void>;
+  onDeleteExpense?: (id: string) => Promise<void>;
+  paymentMethods?: PaymentMethodConfig[];
+  userAgencyId?: string;
 }
 
 const CATEGORY_OPTIONS: { key: ExpenseCategory; label: string }[] = [
@@ -47,7 +60,19 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
   userName,
   userId,
   onCreateExpense,
+  onUpdateExpense,
+  onDeleteExpense,
+  paymentMethods = [],
+  userAgencyId,
 }) => {
+  const methodsFor = (country?: string) =>
+    paymentMethods.filter((m) => m.country === country && m.active).sort((a, b) => a.sortOrder - b.sortOrder);
+  // Cashier and admin may correct an expense; only the admin deletes one.
+  const canEdit = !!onUpdateExpense && (userRole === 'admin' || userRole === 'cashier');
+  const canDelete = !!onDeleteExpense && userRole === 'admin';
+  const [editing, setEditing] = useState<Expense | null>(null);
+  const [deleting, setDeleting] = useState<Expense | null>(null);
+  const period = usePeriodFilter();
   const [showModal, setShowModal] = useState(false);
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<string>('ALL');
@@ -57,7 +82,9 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
   const [category, setCategory] = useState<ExpenseCategory>('transport');
   const [originalAmount, setOriginalAmount] = useState<number | ''>('');
   const [currency, setCurrency] = useState<Currency>('USD');
-  const [agencyId, setAgencyId] = useState(agencies[0]?.id || 'AG-GZ');
+  const [agencyId, setAgencyId] = useState((userRole !== 'admin' && userAgencyId) || agencies[0]?.id || '');
+  const [expenseMethod, setExpenseMethod] = useState('ESPECES');
+  const expenseCountry = agencies.find((a) => a.id === agencyId)?.country;
   const [beneficiary, setBeneficiary] = useState('');
   const [description, setDescription] = useState('');
   const [attachmentName, setAttachmentName] = useState('');
@@ -72,7 +99,7 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
       e.description.toLowerCase().includes(q);
     const matchCat = categoryFilter === 'ALL' || e.category === categoryFilter;
     const matchCountry = countryFilter === 'ALL' || e.country === countryFilter;
-    return matchSearch && matchCat && matchCountry;
+    return matchSearch && matchCat && matchCountry && period.matches(e.date);
   });
 
   const totalUSD = filteredExpenses.reduce((s, e) => s + (e.amountUSD || 0), 0);
@@ -97,6 +124,7 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
         agencyId,
         agencyName: agency?.name || '',
         country: agency?.country || 'RDC',
+        paymentMethod: expenseMethod,
         beneficiary,
         description,
         attachmentName,
@@ -181,6 +209,12 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
         </div>
       </div>
 
+      <PeriodFilterBar
+        value={period.state}
+        onChange={period.setState}
+        summary={<>{filteredExpenses.length} dépense(s) • Total : <span className="text-rose-600">{formatUSD(totalUSD)}</span></>}
+      />
+
       {/* Table */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="overflow-x-auto">
@@ -195,12 +229,13 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
                 <th className="py-3 px-4">Montant Payé</th>
                 <th className="py-3 px-4">Contrevaleur USD</th>
                 <th className="py-3 px-4">Enregistré Par</th>
+                {(canEdit || canDelete) && <th className="py-3 px-4 text-right">Actions</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {filteredExpenses.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-10 text-center text-slate-400">
+                  <td colSpan={9} className="py-10 text-center text-slate-400">
                     Aucune dépense enregistrée dans cette sélection.
                   </td>
                 </tr>
@@ -210,7 +245,7 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
                     <td className="py-3 px-4 font-mono font-bold text-slate-900">
                       {exp.voucherNumber}
                     </td>
-                    <td className="py-3 px-4 whitespace-nowrap">{exp.date}</td>
+                    <td className="py-3 px-4 whitespace-nowrap">{formatDay(exp.date)}</td>
                     <td className="py-3 px-4 font-bold text-slate-800">{exp.categoryLabel}</td>
                     <td className="py-3 px-4 max-w-[220px]">
                       <div className="font-bold text-slate-900">{exp.beneficiary}</div>
@@ -221,6 +256,11 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
                     <td className="py-3 px-4">
                       <div>{exp.agencyName}</div>
                       <div className="text-[10px] text-slate-700 font-bold">{exp.country}</div>
+                      {exp.paymentMethod && (
+                        <div className="text-[10px] text-slate-500">
+                          {methodLabel(normalizeMethod(exp.paymentMethod), exp.country as CashCountry, paymentMethods)}
+                        </div>
+                      )}
                     </td>
                     <td className="py-3 px-4 font-black text-rose-600">
                       {formatCurrency(exp.originalAmount, exp.currency)}
@@ -229,6 +269,15 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
                       {formatUSD(exp.amountUSD)}
                     </td>
                     <td className="py-3 px-4 text-slate-700">{exp.recordedBy}</td>
+                    {(canEdit || canDelete) && (
+                      <td className="py-3 px-4 text-right">
+                        <RowActions
+                          onEdit={canEdit ? () => setEditing(exp) : undefined}
+                          onDelete={canDelete ? () => setDeleting(exp) : undefined}
+                          disabledReason={exp.category === 'salaire' ? 'Dépense de salaire : modifiez ou supprimez le bulletin dans « Salaires »' : undefined}
+                        />
+                      </td>
+                    )}
                   </tr>
                 ))
               )}
@@ -275,13 +324,37 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
                 </label>
                 <select
                   value={agencyId}
-                  onChange={(e) => setAgencyId(e.target.value)}
-                  className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  onChange={(e) => {
+                    setAgencyId(e.target.value);
+                    const country = agencies.find((a) => a.id === e.target.value)?.country;
+                    setExpenseMethod(methodsFor(country)[0]?.code || '');
+                  }}
+                  disabled={userRole !== 'admin'}
+                  className="w-full p-2 rounded-lg border border-slate-300 bg-white disabled:bg-slate-100"
                   required
                 >
                   {agencies.map((a) => (
                     <option key={a.id} value={a.id}>
                       {a.name} ({a.country})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  Payé depuis (moyen de paiement de la caisse) *
+                </label>
+                <select
+                  value={expenseMethod}
+                  onChange={(e) => setExpenseMethod(e.target.value)}
+                  className="w-full p-2 rounded-lg border border-slate-300 bg-white"
+                  required
+                >
+                  {methodsFor(expenseCountry).length === 0 && <option value="">Aucun moyen configuré pour cette caisse</option>}
+                  {methodsFor(expenseCountry).map((m) => (
+                    <option key={m.id} value={m.code}>
+                      {m.label}
                     </option>
                   ))}
                 </select>
@@ -363,6 +436,76 @@ export const ExpensesView: React.FC<ExpensesViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+      {editing && onUpdateExpense && (
+        <EditRecordModal
+          title={`Corriger la dépense ${editing.voucherNumber}`}
+          note="L’ancienne et la nouvelle valeur sont conservées dans le journal d’audit."
+          initialValues={editing}
+          fields={[
+            {
+              name: 'category',
+              label: 'Catégorie',
+              type: 'select',
+              required: true,
+              options: CATEGORY_OPTIONS.filter((o) => o.key !== 'salaire').map((o) => ({ value: o.key, label: o.label })),
+            },
+            { name: 'originalAmount', label: 'Montant', type: 'number', required: true, min: 0.01, step: '0.01' },
+            { name: 'currency', label: 'Devise', type: 'select', options: CURRENCY_OPTIONS, required: true },
+            { name: 'date', label: 'Date', type: 'date', required: true },
+            {
+              name: 'country',
+              label: 'Pays',
+              type: 'select',
+              options: [
+                { value: 'Chine', label: 'Chine' },
+                { value: 'RDC', label: 'RDC' },
+                { value: 'Angola', label: 'Angola' },
+              ],
+            },
+            {
+              name: 'paymentMethod',
+              label: 'Payé depuis',
+              type: 'select',
+              hint: 'Moyen de paiement de la caisse du pays choisi.',
+              options: (() => {
+                const options = methodsFor(editing.country).map((m) => ({ value: m.code, label: m.label }));
+                return !editing.paymentMethod || options.some((o) => o.value === editing.paymentMethod)
+                  ? [{ value: '', label: '— Non précisé —' }, ...options]
+                  : [{ value: editing.paymentMethod, label: `${editing.paymentMethod} (ancien)` }, ...options];
+              })(),
+            },
+            { name: 'beneficiary', label: 'Bénéficiaire', required: true },
+            { name: 'description', label: 'Description', type: 'textarea' },
+          ]}
+          onSubmit={(v) =>
+            onUpdateExpense(editing.id, {
+              category: v.category as ExpenseCategory,
+              categoryLabel: CATEGORY_OPTIONS.find((o) => o.key === v.category)?.label || v.category,
+              originalAmount: Number(v.originalAmount),
+              currency: v.currency as Currency,
+              date: v.date,
+              country: v.country as Expense['country'],
+              beneficiary: v.beneficiary,
+              description: v.description,
+              ...(v.paymentMethod ? { paymentMethod: v.paymentMethod } : {}),
+            })
+          }
+          onClose={() => setEditing(null)}
+        />
+      )}
+      {deleting && onDeleteExpense && (
+        <ConfirmDeleteModal
+          title={`Supprimer la dépense ${deleting.voucherNumber} ?`}
+          message={
+            <>
+              Montant : <strong>{formatCurrency(deleting.originalAmount, deleting.currency)}</strong> ({deleting.beneficiary}).
+              La dépense disparaîtra des totaux ; son détail reste conservé dans le journal d’audit.
+            </>
+          }
+          onConfirm={() => onDeleteExpense(deleting.id)}
+          onClose={() => setDeleting(null)}
+        />
       )}
     </div>
   );
